@@ -1,0 +1,1605 @@
+-- language: Lua, file: mm2_farm_core.lua, target: MM2 (executor)
+
+task.wait(15)
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+local VirtualUser = game:GetService("VirtualUser")
+
+local LP = Players.LocalPlayer
+local WS = workspace
+local DEBUG_VERBOSE = false  -- true = все диагностические warn, false = только критические
+local function dbg(...) if DEBUG_VERBOSE then warn(...) end end
+pcall(function() WS.FallenPartsDestroyHeight = -5000 end)
+
+warn(string.format("[ENV] writefile=%s readfile=%s isfile=%s makefolder=%s isfolder=%s",
+    type(writefile), type(readfile), type(isfile), type(makefolder), type(isfolder)))
+
+local FOLDER = "MM2Farm"
+local CONFIG_FILE = FOLDER .. "/config.json"
+if makefolder and not isfolder(FOLDER) then pcall(makefolder, FOLDER) end
+
+local Config = {
+    AutoFarm = true,
+    FlightSpeed = 45,
+    CoinStayTime = 0.0,
+    CoinOffset = 3,
+    SafeDepth = 50,
+    
+    PostFarmAuto = true,
+    StickyBehind = true,
+    BehindOffset = 0.8,
+    ShotInterval = 0.35,
+    AutoGrabGun = true,
+    GunSafeDist = 5,
+    MaxGunDistance = 900,
+    
+    HopOnError = true,
+    ReconnectDelay = 5,
+    HopTriggerPlayers = 10,
+    HopSearchMaxPlayers = 7,
+    IdleFarmTimeout = 240,
+    AutoRejoinMin = 20,
+    RejoinEnabled = true,
+    lastTeleportFromJobId = "",
+    serverBlacklist = {},
+    
+    NoRender = false,
+    TextureStrip = true,
+    LightingOpt = true,
+    FFlags = true,
+    
+    ResetIfMurderer = true,
+    AntiAFK = false,
+    AntiFling = false,
+    TotalCoins = 0,
+    TotalTime = 0,
+}
+
+local function saveConfig()
+    if not writefile then 
+        warn("[SAVE] writefile unavailable in this executor")
+        return false 
+    end
+    local ok, j = pcall(HttpService.JSONEncode, HttpService, Config)
+    if not ok then 
+        warn("[SAVE] JSONEncode failed: " .. tostring(j))
+        return false 
+    end
+    local ok2, err = pcall(writefile, CONFIG_FILE, j)
+    if not ok2 then
+        warn("[SAVE] writefile failed: " .. tostring(err) .. " path=" .. tostring(CONFIG_FILE))
+    end
+    return ok2
+end
+
+local function loadConfig()
+    if not readfile or not isfile then 
+        warn("[LOAD] readfile/isfile unavailable in this executor")
+        return 
+    end
+    if not isfile(CONFIG_FILE) then
+        warn("[LOAD] no file at " .. tostring(CONFIG_FILE))
+        return
+    end
+    local ok, d = pcall(function() return HttpService:JSONDecode(readfile(CONFIG_FILE)) end)
+    if ok and type(d) == "table" then
+        local n = 0
+        for k, v in pairs(d) do 
+            if Config[k] ~= nil then 
+                Config[k] = v 
+                n = n + 1
+            end 
+        end
+        -- успех молча
+    else
+        warn("[LOAD] JSONDecode failed: " .. tostring(d))
+    end
+end
+loadConfig()
+
+local FarmState = {
+    running = false, conn = nil,
+    currentCoin = nil, phase = "idle",
+    coinCount = 0, coinLimit = 50,
+    lastCollectAt = 0,
+    stayUntil = 0,
+    lastCoinPos = nil,
+    lastCoinCheck = 0,
+    bv = nil, bg = nil,
+    lastShot = 0, lastReset = 0,
+    targetSince = 0, targetAttempts = 0,
+    blacklist = {},
+    lastScan = 0,
+    lastHRPPos = Vector3.zero,
+    lastTeleportAt = 0,
+    lastCoinAt = tick(),
+    lastServerCheck = 0,
+    lastHopAt = 0,
+    -- serverBlacklist теперь в Config
+    hopStreak = 0,
+    hopStreakResetAt = 0,
+    lastGrabAttempt = 0,
+    sessionStartTime = tick(),
+    safeBp = nil,
+    safeBg = nil,
+    inSafeZone = false,
+    lockedY = nil,
+    lockedX = nil,
+    lockedZ = nil,
+    bpCoins = 0,
+    groundPos = nil,
+    pendingCoinPos = nil,
+    roundActiveRemote = nil,
+    postWaitUntil = 0,
+    postSavedPos = nil,
+    lastRealFarmAt = tick(),
+    lastIdleWarnAt = 0,
+}
+_G.FarmState = FarmState
+_G.Config = Config
+
+local function getHRP() 
+    if not LP or not LP.Character then return nil end
+    return LP.Character:FindFirstChild("HumanoidRootPart") 
+end
+local function getHum() local c = LP.Character; return c and c:FindFirstChildOfClass("Humanoid") end
+local notifyGui
+local function notify(m, d) if notifyGui then notifyGui(m, d or 2) end end
+
+local function isRoundActive()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return false end
+    local mainGui = pg:FindFirstChild("MainGUI")
+    if not mainGui then return false end
+    local gameGui = mainGui:FindFirstChild("Game")
+    if not gameGui then return false end
+    if gameGui:FindFirstChild("Timer") and gameGui.Timer:FindFirstChild("XPText") then return true end
+    return false
+end
+
+local TeleportService = game:GetService("TeleportService")
+local GuiService = game:GetService("GuiService")
+local LogService = game:GetService("LogService")
+
+local ReconnectState = { pending = false, lastError = nil, lastAttempt = 0, cooldown = 8 }
+
+local function getServerList()
+    local ok, result = pcall(function()
+        local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100", game.PlaceId)
+        local raw = game:HttpGet(url)
+        return HttpService:JSONDecode(raw)
+    end)
+    if ok and result and result.data then return result.data end
+    return {}
+end
+
+local function doReconnect(forceHop)
+    if ReconnectState.pending and tick() - ReconnectState.lastAttempt < ReconnectState.cooldown then return end
+    ReconnectState.pending = true
+    ReconnectState.lastAttempt = tick()
+
+    -- запоминаем сервер, С КОТОРОГО уходим, чтобы детектить возврат
+    if game.JobId and game.JobId ~= "" then
+        Config.lastTeleportFromJobId = game.JobId
+    end
+
+    if forceHop and game.JobId and game.JobId ~= "" then
+        if not Config.serverBlacklist then Config.serverBlacklist = {} end
+        Config.serverBlacklist[game.JobId] = tick() + 300
+    end
+    saveConfig()
+
+    task.spawn(function()
+        task.wait(Config.ReconnectDelay or 5)
+        task.wait(3)
+
+        local attempts = 0
+        local maxAttempts = 3
+        local lastFailedServer = nil
+
+        local function attemptHop()
+            if attempts >= maxAttempts then
+                ReconnectState.pending = false
+                pcall(function() TeleportService:Teleport(game.PlaceId, LP) end)
+                return
+            end
+            attempts = attempts + 1
+
+            local serverId, players
+            if forceHop and Config.HopOnError then
+                local servers = getServerList()
+                local now = tick()
+                local candidates = {}
+                local targetCount = Config.HopSearchMaxPlayers or 7
+
+                for _, s in ipairs(servers) do
+                    if s.id ~= game.JobId and s.id ~= lastFailedServer and s.playing <= targetCount and s.playing < s.maxPlayers then
+                        local blk = Config.serverBlacklist and Config.serverBlacklist[s.id]
+                        if not blk or now > blk then table.insert(candidates, s) end
+                    end
+                end
+
+                if #candidates > 0 then
+                    local selected = candidates[math.random(1, #candidates)]
+                    serverId = selected.id; players = selected.playing
+                else
+                    local best, bestCount = nil, math.huge
+                    for _, s in ipairs(servers) do
+                        if s.id ~= game.JobId and s.id ~= lastFailedServer and s.playing < s.maxPlayers then
+                            local blk = Config.serverBlacklist and Config.serverBlacklist[s.id]
+                            if not blk or now > blk then
+                                local count = tonumber(s.playing) or math.huge
+                                if count < bestCount then best, bestCount = s.id, count end
+                            end
+                        end
+                    end
+                    serverId, players = best, bestCount
+                end
+            end
+
+            if serverId then
+                lastFailedServer = serverId
+                pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, serverId, LP) end)
+            else
+                ReconnectState.pending = false
+                pcall(function() TeleportService:Teleport(game.PlaceId, LP) end)
+                return
+            end
+        end
+
+        local conn
+        conn = TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
+            if player ~= LP then return end
+            if lastFailedServer then
+                if not Config.serverBlacklist then Config.serverBlacklist = {} end
+                Config.serverBlacklist[lastFailedServer] = tick() + 600
+            end
+            if conn then conn:Disconnect() end
+            task.wait(3)
+            if lastFailedServer == game.JobId then
+                pcall(function() TeleportService:Teleport(game.PlaceId, LP) end)
+            else
+                attemptHop()
+            end
+        end)
+        attemptHop()
+    end)
+end
+
+GuiService.ErrorMessageChanged:Connect(function(msg)
+    if not msg or msg == "" then return end
+    ReconnectState.lastError = msg
+    doReconnect(Config.HopOnError ~= false)
+end)
+LogService.MessageOut:Connect(function(msg, msgType)
+    if msgType ~= Enum.MessageType.MessageError then return end
+    if not msg or msg == "" then return end
+    local lower = msg:lower()
+    if lower:find("disconnect") or lower:find("kicked") 
+        or lower:find("connection lost") or lower:find("lost connection") then
+        doReconnect(Config.HopOnError ~= false)
+    end
+end)
+
+local FAST_FLAGS = {
+    ["DFIntTaskSchedulerTargetFps"]="9999", ["FFlagTaskSchedulerLimitTargetFpsTo2402"]="false",
+    ["DFIntRenderThrottleMaxFps"]="9999", ["FFlagDebugDisableShadows"]="true",
+    ["FIntRenderShadowIntensity"]="0", ["FFlagAdServiceEnabled"]="false",
+    ["DFIntMinimumFrameTime"]="1", ["FFlagDisablePostFx"]="true",
+    ["FFlagRenderCheckThreading"]="true", ["DFIntConnectionMTimesBeforeChain"]="1",
+    ["DFIntSchedulerWaitTime"]="1", ["FFlagDisableTerrainFoliage"]="true",
+    ["DFIntPhysicsSenderMaxBandwidthBps"]="1",
+}
+local function applyFFlags() if type(setfflag) ~= "function" then return end; for k, v in pairs(FAST_FLAGS) do pcall(setfflag, k, v) end end
+
+local function stripOne(d)
+    pcall(function()
+        if d:IsA("MeshPart") then d.TextureID = ""; d.Material = Enum.Material.SmoothPlastic
+        elseif d:IsA("Part") or d:IsA("WedgePart") or d:IsA("TrussPart") or d:IsA("CornerWedgePart") then d.Material = Enum.Material.SmoothPlastic
+        elseif d:IsA("SpecialMesh") then d.TextureId = ""; d.MeshId = ""
+        elseif d:IsA("SurfaceAppearance") then d.ColorMap=""; d.NormalMap=""; d.RoughnessMap=""; d.MetalnessMap=""
+        elseif d:IsA("Decal") or d:IsA("Texture") then d.Texture = ""
+        elseif d:IsA("ImageLabel") then d.Image = ""
+        elseif d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam") or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Sparkles") then d.Enabled = false
+        elseif d:IsA("Explosion") then d.Visible = false
+        end
+    end)
+end
+local function aggressiveStrip() for _, d in ipairs(WS:GetDescendants()) do stripOne(d) end end
+local function applyLighting()
+    pcall(function()
+        Lighting.GlobalShadows = false; Lighting.ShadowSoftness = 0; Lighting.EnvironmentDiffuseScale = 0; Lighting.EnvironmentSpecularScale = 0
+        Lighting.OutdoorAmbient = Color3.new(1,1,1); Lighting.Ambient = Color3.new(1,1,1); Lighting.Brightness = 1; Lighting.FogEnd = 100000; Lighting.FogStart = 100000; Lighting.ClockTime = 12
+        for _, v in ipairs(Lighting:GetChildren()) do if v:IsA("PostEffect") or v:IsA("Atmosphere") or v:IsA("Sky") then pcall(function() v.Enabled = false end) end end
+        pcall(function() local s = settings(); if s and s.Rendering then s.Rendering.QualityLevel = Enum.QualityLevel.Level01 end end)
+        pcall(function() local us = UserSettings(); if us then us.GameSettings.SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel1 end end)
+    end)
+    pcall(function() WS.Terrain.WaterWaveSize = 0; WS.Terrain.WaterWaveSpeed = 0; WS.Terrain.WaterReflectance = 0; WS.Terrain.WaterTransparency = 1; WS.Terrain.Decoration = false end)
+end
+local function stripChar(plr)
+    local c = plr and plr.Character
+    if not c then return end
+    pcall(function() local hum = c:FindFirstChildOfClass("Humanoid"); if hum then hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None end end)
+end
+local optConn = nil
+local optThread = nil
+local function startOptimize()
+    aggressiveStrip()
+    if Config.LightingOpt then applyLighting() end
+    if Config.FFlags then applyFFlags() end
+    if not optConn then optConn = WS.DescendantAdded:Connect(function(d) if Config.TextureStrip then task.defer(stripOne, d) end end) end
+    if not optThread then
+        optThread = task.spawn(function()
+            while getgenv().MM2FarmLoaded do
+                task.wait(5)
+                -- aggressiveStrip убран: WS.DescendantAdded уже ловит новые объекты
+                if Config.LightingOpt then applyLighting() end
+                for _, p in ipairs(Players:GetPlayers()) do stripChar(p) end
+            end
+        end)
+    end
+end
+local function stopOptimize()
+    if optConn then optConn:Disconnect(); optConn = nil end
+    if optThread then pcall(task.cancel, optThread); optThread = nil end
+end
+
+local noRenderGui
+local function setNoRender(state)
+    Config.NoRender = state
+    pcall(function() RunService:Set3dRenderingEnabled(not state) end)
+    if state and not noRenderGui then
+        noRenderGui = Instance.new("ScreenGui")
+        noRenderGui.Name = "MM2Farm_NoRender"; noRenderGui.DisplayOrder = -99999; noRenderGui.IgnoreGuiInset = true; noRenderGui.ResetOnSpawn = false
+        local f = Instance.new("Frame"); f.Size = UDim2.new(1,0,1,0); f.BackgroundColor3 = Color3.new(0,0,0); f.BorderSizePixel = 0; f.Parent = noRenderGui
+        pcall(function() noRenderGui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+        if not noRenderGui.Parent then noRenderGui.Parent = LP:WaitForChild("PlayerGui") end
+    elseif not state and noRenderGui then noRenderGui:Destroy(); noRenderGui = nil end
+    saveConfig()
+end
+
+local afkConn
+local function startAntiAFK()
+    if afkConn or not LP then return end
+    afkConn = LP.Idled:Connect(function() pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end) end)
+end
+local function stopAntiAFK() if afkConn then afkConn:Disconnect(); afkConn = nil end end
+
+local noclipConn = nil
+local function setNoclip(on)
+    if on then
+        if noclipConn then return end
+        noclipConn = RunService.Stepped:Connect(function()
+            local c = LP.Character
+            if not c then return end
+            for _, p in ipairs(c:GetDescendants()) do if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end end
+        end)
+    else
+        if noclipConn then noclipConn:Disconnect(); noclipConn = nil end
+        local c = LP.Character
+        if c then for _, p in ipairs(c:GetDescendants()) do if p:IsA("BasePart") then p.CanCollide = true end end end
+    end
+end
+
+local function blacklistAdd(coin) table.insert(FarmState.blacklist, { coin = coin, expiresAt = tick() + 10 }) end
+local function blacklistCheck(coin)
+    local now = tick()
+    for i = #FarmState.blacklist, 1, -1 do
+        local b = FarmState.blacklist[i]
+        if now > b.expiresAt then table.remove(FarmState.blacklist, i)
+        elseif b.coin == coin then return true end
+    end
+    return false
+end
+
+local function findCoinContainer()
+    local cc = WS:FindFirstChild("CoinContainer", true)
+    if cc then return cc end
+    for _, d in ipairs(WS:GetDescendants()) do if d.Name == "CoinContainer" then return d end end
+end
+local function isCoinLive(c)
+    if not c or not c.Parent then return false end
+    if c.CanTouch == false then return false end
+    if c:GetAttribute("Taken") or c:GetAttribute("Collected") then return false end
+    if not c:FindFirstChild("CoinVisual") then return false end
+    if blacklistCheck(c) then return false end
+    return true
+end
+local function getAllCoins()
+    local out = {}
+    local cc = findCoinContainer()
+    if not cc then return out end
+    for _, c in ipairs(cc:GetChildren()) do if c:IsA("BasePart") and c.Name == "Coin_Server" and isCoinLive(c) then out[#out+1] = c end end
+    return out
+end
+local function getNearestCoin(fromPos)
+    local best, bestD
+    for _, c in ipairs(getAllCoins()) do
+        local d = (c.Position - fromPos).Magnitude
+        if not bestD or d < bestD then best, bestD = c, d end
+    end
+    return best, bestD
+end
+local function fireTouch(coin, parts)
+    if type(firetouchinterest) ~= "function" then return end
+    for _, p in ipairs(parts) do pcall(firetouchinterest, p, coin, 0) end
+    for _, p in ipairs(parts) do pcall(firetouchinterest, p, coin, 1) end
+end
+
+local function ensureMovers(hrp)
+    if not FarmState.bv or not FarmState.bv.Parent then
+        if FarmState.bv then pcall(function() FarmState.bv:Destroy() end) end
+        FarmState.bv = Instance.new("BodyVelocity"); FarmState.bv.Name = "MM2Farm_BV"; FarmState.bv.MaxForce = Vector3.new(1e5, 1e5, 1e5); FarmState.bv.P = 3000; FarmState.bv.Velocity = Vector3.zero; FarmState.bv.Parent = hrp
+    end
+    if not FarmState.bg or not FarmState.bg.Parent then
+        if FarmState.bg then pcall(function() FarmState.bg:Destroy() end) end
+        FarmState.bg = Instance.new("BodyGyro"); FarmState.bg.Name = "MM2Farm_BG"; FarmState.bg.MaxTorque = Vector3.new(1e6, 1e6, 1e6); FarmState.bg.P = 3000; FarmState.bg.D = 500; FarmState.bg.CFrame = hrp.CFrame; FarmState.bg.Parent = hrp
+    end
+end
+local function detachMovers()
+    if FarmState.bv then pcall(function() FarmState.bv:Destroy() end); FarmState.bv = nil end
+    if FarmState.bg then pcall(function() FarmState.bg:Destroy() end); FarmState.bg = nil end
+end
+local function detachSafeMovers()
+    if FarmState.safeBp then pcall(function() FarmState.safeBp:Destroy() end); FarmState.safeBp = nil end
+    if FarmState.safeBg then pcall(function() FarmState.safeBg:Destroy() end); FarmState.safeBg = nil end
+end
+
+local function setPhase(p)
+    if FarmState.phase == p then return end
+    dbg(string.format("[PHASE] %s -> %s", tostring(FarmState.phase), tostring(p)))
+    FarmState.phase = p
+    if p == "farm" then setNoclip(true) else setNoclip(false) end
+end 
+
+local function findGroundY(fromPos)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = LP.Character and {LP.Character} or {}
+    params.IgnoreWater = true
+    params.RespectCanCollide = true
+    local result = workspace:Raycast(
+        Vector3.new(fromPos.X, fromPos.Y + 50, fromPos.Z),
+        Vector3.new(0, -20000, 0),
+        params
+    )
+    return result and result.Position.Y or nil
+end
+
+local function findLobbyPos()
+    local lobby = workspace:FindFirstChild("Lobby")
+    if not lobby then return nil end
+    local part = lobby.PrimaryPart or lobby:FindFirstChild("Box") or lobby:FindFirstChildWhichIsA("BasePart")
+    if part then return part.Position end
+    return nil
+end
+
+local function stickBehind(hrp, murd)
+    local mHRP = murd.Character and murd.Character:FindFirstChild("HumanoidRootPart")
+    if not mHRP then return end
+    local behind = mHRP.Position - mHRP.CFrame.LookVector * Config.BehindOffset
+    hrp.CFrame = CFrame.lookAt(behind, mHRP.Position)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+    if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
+end
+
+-- ПОЛНОСТЬЮ ЗАЩИЩЁННЫЙ shootMurd (без VirtualUser fallback)
+local function shootMurd()
+    pcall(function()
+        local m = getMurd()
+        if not m or not m.Character then return end
+        local mHRP = m.Character:FindFirstChild("HumanoidRootPart")
+        if not mHRP then return end
+        
+        local gun = getGunTool()
+        if not gun then return end
+        
+        local shootEv = gun:FindFirstChild("Shoot")
+        if not shootEv then return end
+        if not shootEv:IsA("RemoteEvent") then return end
+        
+        local myHRP = getHRP()
+        if not myHRP then return end
+        
+        local originPos = myHRP.Position + Vector3.new(0, 1, 0)
+        local targetPos = mHRP.Position
+        
+        local A_1 = CFrame.lookAt(originPos, targetPos)
+        local A_2 = CFrame.new(targetPos)
+        
+        shootEv:FireServer(A_1, A_2)
+    end)
+end
+
+local function resetSelf() local h = getHum(); if h then h.Health = 0 end end
+
+local function getMyRole()
+    local ok, rd = pcall(function()
+        local r = ReplicatedStorage:FindFirstChild("GetPlayerData", true)
+        if r and r:IsA("RemoteFunction") then return r:InvokeServer() end
+    end)
+    if ok and type(rd) == "table" then
+        local me = rd[LP.Name]
+        if me and me.Role then return me.Role end
+    end
+    return nil
+end
+
+local function getMurd()
+    local ok, rd = pcall(function()
+        local r = ReplicatedStorage:FindFirstChild("GetPlayerData", true)
+        if r and r:IsA("RemoteFunction") then return r:InvokeServer() end
+    end)
+    if ok and type(rd) == "table" then
+        for name, info in pairs(rd) do
+            if info.Role == "Murderer" and not info.Killed and not info.Dead then
+                local p = Players:FindFirstChild(name)
+                if p and p ~= LP and p.Character then return p end
+            end
+        end
+    end
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP and p.Character then
+            local bp = p:FindFirstChild("Backpack")
+            if (bp and bp:FindFirstChild("Knife")) or p.Character:FindFirstChild("Knife") then return p end
+        end
+    end
+end
+local function getGunTool()
+    local c = LP.Character
+    local bp = LP:FindFirstChild("Backpack")
+    return (c and c:FindFirstChild("Gun")) or (bp and bp:FindFirstChild("Gun"))
+end
+local function hasGun() return getGunTool() ~= nil end
+local function hasKnife()
+    local c = LP.Character
+    local bp = LP:FindFirstChild("Backpack")
+    return (c and c:FindFirstChild("Knife")) or (bp and bp:FindFirstChild("Knife")) ~= nil
+end
+local function equipGun()
+    local g = getGunTool()
+    if not g then return false end
+    if g.Parent == LP.Character then return true end
+    local hum = getHum()
+    if not hum then return false end
+    pcall(hum.EquipTool, hum, g)
+    for _ = 1, 10 do task.wait(0.05); if g.Parent == LP.Character then return true end end
+    return false
+end
+local function charParts()
+    local c = LP.Character
+    if not c then return {} end
+    local out = {}
+    for _, p in ipairs(c:GetChildren()) do if p:IsA("BasePart") then out[#out+1] = p end end
+    return out
+end
+
+local function findGunDrop()
+    local gd = WS:FindFirstChild("GunDrop")
+    if gd then
+        if gd:IsA("BasePart") then return gd end
+        if gd:IsA("Model") and gd.PrimaryPart then return gd.PrimaryPart end
+        if gd:IsA("Model") then
+            local handle = gd:FindFirstChild("Handle", true)
+            if handle and handle:IsA("BasePart") then return handle end
+        end
+        if gd:IsA("Tool") then
+            local handle = gd:FindFirstChild("Handle")
+            if handle and handle:IsA("BasePart") then return handle end
+        end
+    end
+    for _, obj in ipairs(WS:GetChildren()) do
+        if obj:IsA("Tool") and obj.Name == "Gun" then
+            local handle = obj:FindFirstChild("Handle")
+            if handle and handle:IsA("BasePart") then return handle end
+        end
+    end
+    return nil
+end
+
+local function canSafelyGrab(gunPos)
+    local murd = getMurd()
+    if not murd or not murd.Character then return true, 999 end
+    local mHRP = murd.Character:FindFirstChild("HumanoidRootPart")
+    if not mHRP then return true, 999 end
+    local d = (mHRP.Position - gunPos).Magnitude
+    return d >= Config.GunSafeDist, d
+end
+
+local function postFarmStep(hrp)
+    local now = tick()
+    ensureMovers(hrp)
+
+    -- ФАЗА ОЖИДАНИЯ: сидим в сейв-зоне после промаха
+    if FarmState.postWaitUntil > 0 and now < FarmState.postWaitUntil then
+        if FarmState.postSavedPos then
+            hrp.CFrame = CFrame.new(FarmState.postSavedPos)
+        end
+        if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
+        return
+    end
+
+    if hasGun() then
+        local m = getMurd()
+        if m and m.Character then
+            local mHRP = m.Character:FindFirstChild("HumanoidRootPart")
+            local mHum = m.Character:FindFirstChildOfClass("Humanoid")
+            if mHRP and mHum and mHum.Health > 0 then
+                equipGun()
+
+                -- выстрел только если не в кулдауне проверки результата
+                if now - FarmState.lastShot > Config.ShotInterval then
+                    FarmState.lastShot = now
+                    FarmState.postSavedPos = hrp.Position
+                    FarmState.postWaitUntil = now + 0.6
+
+                    local behind = mHRP.Position - mHRP.CFrame.LookVector * Config.BehindOffset
+                    local shooterChar = m.Character
+
+                    -- телепорт к мардеру + выстрел (в spawn чтобы не блокировать Heartbeat)
+                    task.spawn(function()
+                        local h = getHRP()
+                        if not h then return end
+                        h.CFrame = CFrame.lookAt(behind, mHRP.Position)
+                        h.AssemblyLinearVelocity = Vector3.zero
+                        h.AssemblyAngularVelocity = Vector3.zero
+                        shootMurd()
+                    end)
+
+                    -- проверка результата через 0.6с
+                    task.spawn(function()
+                        task.wait(0.6)
+                        local mHum2 = shooterChar and shooterChar.Parent and shooterChar:FindFirstChildOfClass("Humanoid")
+                        if mHum2 and mHum2.Health > 0 then
+                            -- промах: ждём 6 секунд в сейв-зоне
+                            FarmState.postWaitUntil = tick() + 6
+                            warn(string.format("[POST] miss → back to safe, wait 6s (hp=%.0f)", mHum2.Health))
+                        else
+                            -- попал: murderer мёртв
+                            FarmState.postWaitUntil = 0
+                        end
+                    end)
+                end
+                return
+            end
+        end
+        return
+    end
+
+    -- нет пушки — пробуем подобрать
+    if Config.AutoGrabGun then
+        local gd = findGunDrop()
+        if gd then
+            local safe, dist = canSafelyGrab(gd.Position)
+            if safe then
+                local delta = gd.Position - hrp.Position
+                if delta.Magnitude > 3 then
+                    FarmState.bv.Velocity = delta.Unit * Config.FlightSpeed
+                    if FarmState.bg then FarmState.bg.CFrame = CFrame.new(hrp.Position) * CFrame.Angles(math.rad(90), 0, 0) end
+                else
+                    FarmState.bv.Velocity = Vector3.zero
+                    fireTouch(gd, charParts())
+                end
+                return
+            else
+                FarmState.bv.Velocity = Vector3.zero
+                return
+            end
+        end
+    end
+
+    if hasKnife() then
+        if Config.ResetIfMurderer and now - FarmState.lastReset > 3 then
+            FarmState.lastReset = now
+            resetSelf()
+        end
+        return
+    end
+
+    if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
+end
+
+local function masterStep()
+    local now = tick()
+    local hrp = getHRP()
+    local hum = getHum()
+    if not hrp or not hum or hum.Health <= 0 then return end
+
+    local pos = hrp.Position
+
+    -- === IDLE SWAP (работает независимо от monitorServers) ===
+    if Config.AutoFarm and FarmState.running and FarmState.phase ~= "post" then
+        local idle = now - (FarmState.lastRealFarmAt or 0)
+        if idle > (Config.IdleFarmTimeout or 240) then
+            warn(string.format("[IDLE-SWAP] no coins for %.0fs (phase=%s players=%d) → hop", 
+                idle, tostring(FarmState.phase), #Players:GetPlayers()))
+            if not Config.serverBlacklist then Config.serverBlacklist = {} end
+            Config.serverBlacklist[game.JobId] = now + 300
+            FarmState.lastHopAt = now
+            FarmState.hopStreak = (FarmState.hopStreak or 0) + 1
+            FarmState.lastRealFarmAt = now  -- сброс, чтобы не спамить
+            doReconnect(true)
+            return
+        end
+    end
+
+    local lobbyPos = findLobbyPos()
+    local inLobby = lobbyPos and (pos - lobbyPos).Magnitude < 150
+
+    -- детект телепорта: смена позиции на 200+ студов за кадр = сервер переместил
+    local posDelta = (pos - FarmState.lastHRPPos).Magnitude
+    if posDelta > 200 and lobbyPos then
+        if inLobby then
+            FarmState.roundActiveRemote = false
+            FarmState.inSafeZone = false
+            detachSafeMovers()
+            dbg(string.format("[TP] → lobby (Y=%.0f, dist=%.0f)", pos.Y, (pos - lobbyPos).Magnitude))
+        else
+            FarmState.roundActiveRemote = true
+            dbg(string.format("[TP] → map (Y=%.0f, distFromLobby=%.0f)", pos.Y, (pos - lobbyPos).Magnitude))
+        end
+    end
+
+    local roundActive = (FarmState.roundActiveRemote == true)
+
+    if pos.Y < -4500 then
+        resetSelf()
+        return
+    end
+
+    if FarmState.inSafeZone and FarmState.lockedY 
+        and math.abs(pos.Y - FarmState.lockedY) > 80 
+        and math.abs(pos.Y - FarmState.lockedY) < 3000 then
+        detachSafeMovers()
+        FarmState.inSafeZone = false
+        setPhase("wait")
+    end
+    FarmState.lastHRPPos = pos
+
+    -- РЕЖИМ ОЖИДАНИЯ (стоим, не лежим)
+    if FarmState.phase == "idle" or FarmState.phase == "wait" then
+        hum.PlatformStand = false
+        
+        if not FarmState.inSafeZone then
+            local groundY = findGroundY(pos)
+            -- только в раунде (не в лобби), вплотную к полу, не в падении
+            if groundY
+                and roundActive
+                and not inLobby
+                and math.abs(pos.Y - groundY) < 50
+                and math.abs(hrp.AssemblyLinearVelocity.Y) < 20 then
+                FarmState.inSafeZone = true
+                FarmState.lockedX = pos.X
+                FarmState.lockedZ = pos.Z
+                FarmState.lockedY = groundY - Config.SafeDepth
+                
+                hrp.CFrame = CFrame.new(FarmState.lockedX, FarmState.lockedY, FarmState.lockedZ)
+                
+                FarmState.safeBp = Instance.new("BodyPosition")
+                FarmState.safeBp.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                FarmState.safeBp.P = 50000
+                FarmState.safeBp.Position = Vector3.new(FarmState.lockedX, FarmState.lockedY, FarmState.lockedZ)
+                FarmState.safeBp.Parent = hrp
+            end
+        end
+        
+        if FarmState.safeBp then
+            FarmState.safeBp.Position = Vector3.new(FarmState.lockedX, FarmState.lockedY, FarmState.lockedZ)
+        end
+
+        local coins = getAllCoins()
+        local nearest, dist = getNearestCoin(pos)
+
+        if #coins > 0 and nearest and dist < 2000 
+            and math.abs(nearest.Position.Y - pos.Y) < 100 then
+            detachSafeMovers()
+            FarmState.inSafeZone = false
+            setPhase("farm")
+            return
+        end
+        return
+    end
+
+    -- РЕЖИМ ФАРМА (лежим на животе, X=90)
+    if FarmState.phase == "farm" then
+        hum.PlatformStand = true
+        
+        if Config.PostFarmAuto and FarmState.coinCount >= FarmState.coinLimit then
+            if hasGun() then setPhase("post"); detachMovers() 
+            else resetSelf(); setPhase("idle") end
+            return
+        end
+
+        -- ЯВНЫЙ БЛОК ЗАДЕРЖКИ (через lastCollectAt, устойчив к спаму ремоутов)
+        if Config.CoinStayTime > 0 and FarmState.lastCollectAt > 0 
+            and (now - FarmState.lastCollectAt) < Config.CoinStayTime then
+            local target = FarmState.lastCoinPos
+            if target then
+                local delta = target - pos
+                if delta.Magnitude > 1 then
+                    ensureMovers(hrp)
+                    FarmState.bv.Velocity = delta.Unit * Config.FlightSpeed
+                else
+                    if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
+                end
+            else
+                if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
+            end
+            if FarmState.bg then FarmState.bg.CFrame = CFrame.new(pos) * CFrame.Angles(math.rad(90), 0, 0) end
+            return
+        end
+
+if Config.AutoGrabGun and not hasGun() then
+    local gd = findGunDrop()
+            if gd then
+                local distToGun = (gd.Position - pos).Magnitude
+                local safe, distToMurd = canSafelyGrab(gd.Position)
+                if safe and distToGun <= Config.MaxGunDistance and now - FarmState.lastGrabAttempt > 2 then
+                    FarmState.lastGrabAttempt = now
+                    local savedCFrame = hrp.CFrame
+                    hrp.CFrame = gd.CFrame
+                    task.wait(0.1)
+                    fireTouch(gd, charParts())
+                    task.wait(0.1)
+                    hrp.CFrame = savedCFrame
+                    task.wait(0.1)
+                    if hasGun() then equipGun() end
+                    return
+                end
+            end
+        end
+
+        ensureMovers(hrp)
+
+if FarmState.currentCoin then
+    if not FarmState.currentCoin.Parent or not isCoinLive(FarmState.currentCoin) then
+        blacklistAdd(FarmState.currentCoin)
+        FarmState.lastCoinPos = FarmState.pendingCoinPos or (pos - Vector3.new(0, Config.CoinOffset, 0))
+        FarmState.pendingCoinPos = nil
+        FarmState.stayUntil = now + Config.CoinStayTime
+        FarmState.currentCoin = nil; FarmState.targetAttempts = 0; FarmState.targetSince = 0
+        FarmState.lastCollectAt = now; FarmState.lastCoinAt = now
+        FarmState.lastRealFarmAt = now
+    elseif now - FarmState.targetSince > 2.0 then
+        blacklistAdd(FarmState.currentCoin)
+                blacklistAdd(FarmState.currentCoin)
+                FarmState.currentCoin = nil; FarmState.targetAttempts = 0; FarmState.targetSince = 0
+                if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
+                return
+            end
+        end
+
+if not FarmState.currentCoin or (now - FarmState.lastScan > 0.2) then
+    FarmState.lastScan = now
+    local nearest = getNearestCoin(hrp.Position)
+    if nearest then
+        if nearest ~= FarmState.currentCoin then
+            FarmState.currentCoin = nearest; FarmState.targetSince = now; FarmState.targetAttempts = 0
+            -- Не сбрасываем lastCoinPos, если ещё в задержке
+            if now >= FarmState.stayUntil then
+                FarmState.lastCoinPos = nil
+            end
+                end
+            else
+                FarmState.currentCoin = nil
+            end
+        end
+
+        local target = FarmState.currentCoin
+        if not target then
+            if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
+            if now - FarmState.lastCollectAt > 5 then setPhase("wait") end
+            return
+        end
+
+        local goal = target.Position - Vector3.new(0, Config.CoinOffset, 0)
+        local delta = goal - pos
+        local dist = delta.Magnitude
+        
+        -- ЛЕЖИМ НА ЖИВОТЕ (X=90)
+        if FarmState.bg then FarmState.bg.CFrame = CFrame.new(pos) * CFrame.Angles(math.rad(90), 0, 0) end
+        
+        if dist > 0.5 then
+            FarmState.bv.Velocity = delta.Unit * Config.FlightSpeed
+        else
+            FarmState.bv.Velocity = Vector3.zero
+        end
+        
+if dist < 10 then
+    FarmState.pendingCoinPos = target.Position - Vector3.new(0, Config.CoinOffset, 0)
+    fireTouch(target, charParts())
+    FarmState.targetAttempts = FarmState.targetAttempts + 1
+    if not target.Parent or not isCoinLive(target) then
+        FarmState.lastCoinPos = FarmState.pendingCoinPos
+        FarmState.pendingCoinPos = nil
+        FarmState.stayUntil = now + Config.CoinStayTime
+                FarmState.currentCoin = nil; FarmState.targetAttempts = 0; FarmState.targetSince = 0
+                FarmState.lastCollectAt = now; FarmState.lastCoinAt = now
+                if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
+            end
+        end
+        return
+    end
+
+    if FarmState.phase == "post" then
+        hum.PlatformStand = false
+        if not roundActive then
+            detachMovers()
+            setPhase("wait")
+            return
+        end
+        postFarmStep(hrp)
+        return
+    end
+end
+
+
+local function startFarm()
+    if FarmState.running then return end
+    local hrp = getHRP()
+    if not hrp then
+        task.spawn(function()
+            local deadline = tick() + 60
+            while tick() < deadline and getgenv().MM2FarmLoaded do
+                task.wait(1)
+                if getHRP() and Config.AutoFarm then startFarm(); return end
+            end
+        end)
+        return
+    end
+    FarmState.running = true
+    FarmState.lastHRPPos = hrp.Position
+    FarmState.lastTeleportAt = 0
+
+    -- детект возврата на тот же сервер
+    if Config.lastTeleportFromJobId == game.JobId and game.JobId ~= "" then
+        warn("[SWAP] returned to SAME server " .. game.JobId .. " — retry in 90s")
+        Config.lastTeleportFromJobId = ""  -- сброс, чтобы не зациклиться навсегда
+        saveConfig()
+        task.delay(90, function()
+            if FarmState.running and Config.AutoFarm then
+                FarmState.lastHopAt = 0  -- снять блокировку 8 сек в monitorServers
+                warn("[SWAP] retrying hop after same-server detection")
+                doReconnect(true)
+            end
+        end)
+    else
+        -- успешный свап на новый сервер
+        Config.lastTeleportFromJobId = ""
+        saveConfig()
+    end
+    FarmState.lastCoinAt = tick()
+    FarmState.lastHopAt = tick()
+    FarmState.lastServerCheck = tick()
+    FarmState.inSafeZone = false
+    FarmState.lastRealFarmAt = tick()
+    setPhase("idle")
+
+    -- ИНИЦИАЛИЗАЦИЯ: где мы прямо сейчас — в лобби или в раунде
+    task.spawn(function()
+        task.wait(0.5)
+        local lobbyPos = findLobbyPos()
+        if not lobbyPos then
+            warn("[INIT] workspace.Lobby not found — waiting for signals")
+            return
+        end
+        warn(string.format("[INIT] lobby center=(%.0f, %.0f, %.0f)", lobbyPos.X, lobbyPos.Y, lobbyPos.Z))
+
+        local _hrp = getHRP()
+        if not _hrp then
+            warn("[INIT] no character yet — waiting for spawn")
+            return
+        end
+
+        local distFromLobby = (_hrp.Position - lobbyPos).Magnitude
+        warn(string.format("[INIT] charY=%.0f distFromLobby=%.0f", _hrp.Position.Y, distFromLobby))
+
+        if distFromLobby < 150 then
+            FarmState.roundActiveRemote = false
+            warn("[INIT] → LOBBY (close to lobby center)")
+        else
+            FarmState.roundActiveRemote = true
+            warn("[INIT] → MAP (far from lobby center, round in progress)")
+        end
+
+        FarmState.lastHRPPos = _hrp.Position
+    end)
+    FarmState.conn = RunService.Heartbeat:Connect(masterStep)
+
+    -- если запустили посреди раунда, RoundStart уже прошёл — узнаём через роль
+    if FarmState.roundActiveRemote == nil then
+        task.spawn(function()
+            task.wait(2)
+            if FarmState.roundActiveRemote == nil then
+                local role = getMyRole()
+                if role and role ~= "None" and role ~= "" then
+                    FarmState.roundActiveRemote = true
+                    warn("[INIT] role detected: " .. tostring(role) .. " → round in progress")
+                elseif hasKnife() or hasGun() then
+                    FarmState.roundActiveRemote = true
+                    warn("[INIT] knife/gun in inventory → round in progress")
+                elseif #getAllCoins() > 0 then
+                    FarmState.roundActiveRemote = true
+                    warn("[INIT] coins on map → round in progress")
+                else
+                    warn("[INIT] no role, no weapons, no coins → waiting for RoundStart")
+                end
+            end
+        end)
+    end
+end
+local function stopFarm()
+    if not FarmState.running then return end
+    FarmState.running = false
+    if FarmState.conn then FarmState.conn:Disconnect(); FarmState.conn = nil end
+    detachMovers(); detachSafeMovers(); setNoclip(false)
+    FarmState.inSafeZone = false
+    local hum = getHum(); if hum then hum.PlatformStand = false end
+    FarmState.phase = "idle"
+end
+
+local function monitorServers()
+    local now = tick()
+
+    -- диагностика раз в 30 сек независимо от всего
+    if not FarmState.lastIdleWarnAt or now - FarmState.lastIdleWarnAt > 30 then
+        FarmState.lastIdleWarnAt = now
+        local hum = getHum()
+        local idle = now - (FarmState.lastRealFarmAt or 0)
+        warn(string.format("[MON] idle=%.0fs/%ds phase=%s run=%s af=%s hp=%s players=%d streak=%d pending=%s",
+            idle, Config.IdleFarmTimeout or 240, tostring(FarmState.phase),
+            tostring(FarmState.running), tostring(Config.AutoFarm),
+            tostring(hum and hum.Health), #Players:GetPlayers(),
+            FarmState.hopStreak, tostring(ReconnectState.pending)))
+    end
+
+    if now - FarmState.lastServerCheck < 1 then return end
+    FarmState.lastServerCheck = now
+    if now - FarmState.lastHopAt < 8 then return end
+
+    if now - FarmState.hopStreakResetAt > 120 then FarmState.hopStreak = 0; FarmState.hopStreakResetAt = now end
+    if FarmState.hopStreak >= 10 then return end
+
+    -- idle проверка ПЕРВАЯ (до players-count)
+    if Config.AutoFarm and FarmState.running then
+        local idle = now - (FarmState.lastRealFarmAt or 0)
+        if idle > (Config.IdleFarmTimeout or 240) then
+            warn(string.format("[IDLE] no coins for %.0fs (phase=%s) → hop", idle, tostring(FarmState.phase)))
+            if not Config.serverBlacklist then Config.serverBlacklist = {} end
+            Config.serverBlacklist[game.JobId] = now + 300
+            FarmState.lastHopAt = now
+            FarmState.hopStreak = FarmState.hopStreak + 1
+            doReconnect(true)
+            return
+        end
+    end
+
+    -- players-count проверка ВТОРАЯ (только если idle ещё не сработал)
+    local count = #Players:GetPlayers()
+    if count > Config.HopTriggerPlayers then
+        warn(string.format("[PLAYERS] %d > %d → hop", count, Config.HopTriggerPlayers))
+        FarmState.lastHopAt = now
+        FarmState.hopStreak = FarmState.hopStreak + 1
+        doReconnect(true)
+        return
+    end
+end
+
+task.spawn(function()
+    warn("[MON] loop started")
+    while getgenv().MM2FarmLoaded do
+        task.wait(2)
+        local ok, err = pcall(monitorServers)
+        if not ok then warn("[MON] error: " .. tostring(err)) end
+    end
+    warn("[MON] loop ended")
+end)
+
+task.spawn(function()
+    while getgenv().MM2FarmLoaded do
+        task.wait(1)
+        if FarmState.running then
+            Config.TotalTime = (Config.TotalTime or 0) + 1
+            if Config.TotalTime % 120 == 0 then saveConfig() end
+        end
+    end
+end)
+
+task.spawn(function()
+    local remotes = ReplicatedStorage:WaitForChild("Remotes", 30)
+    if not remotes then return end
+    local gp = remotes:WaitForChild("Gameplay", 30)
+    if not gp then return end
+    local cc = gp:FindFirstChild("CoinCollected")
+    if cc then
+        cc.OnClientEvent:Connect(function(a, b, c)
+            local cur, max
+            if type(b) == "number" and type(c) == "number" then cur, max = b, c
+            elseif type(a) == "number" and type(b) == "number" then cur, max = a, b end
+            if type(cur) == "number" then
+                local diff = cur - FarmState.coinCount
+                if diff > 0 then
+                    Config.TotalCoins = (Config.TotalCoins or 0) + diff
+                    -- saveConfig() убран: сохраняем только по таймеру (120с) и при выгрузке
+                end
+                FarmState.coinCount = cur
+                if type(max) == "number" and max > 0 then FarmState.coinLimit = max end
+            end
+        end)
+    end
+    local cs = gp:FindFirstChild("CoinsStarted")
+    if cs then
+        cs.OnClientEvent:Connect(function(data)
+            FarmState.coinCount = 0; FarmState.lastCoinAt = tick()
+            if type(data) == "table" and data.Coin and data.Coin.CollectionLimit then FarmState.coinLimit = data.Coin.CollectionLimit end
+        end)
+    end
+
+    local roundStart = gp:FindFirstChild("RoundStart")
+    if roundStart then
+        roundStart.OnClientEvent:Connect(function()
+            local hrp = getHRP()
+            local lobbyPos = findLobbyPos()
+            local inLobby = hrp and lobbyPos and (hrp.Position - lobbyPos).Magnitude < 150
+            if hrp and lobbyPos and not inLobby then
+                FarmState.roundActiveRemote = true
+                FarmState.lastCoinAt = tick()
+                FarmState.coinCount = 0
+                FarmState.currentCoin = nil
+                FarmState.lastCoinPos = nil
+                FarmState.pendingCoinPos = nil
+            else
+                dbg("[ROUNDSTART] ignored — still in lobby")
+            end
+        end)
+    end
+
+    local roundEnd = gp:FindFirstChild("RoundEndFade")
+    if roundEnd then
+        roundEnd.OnClientEvent:Connect(function()
+            FarmState.roundActiveRemote = false
+            FarmState.coinCount = 0
+            FarmState.coinLimit = 50
+            FarmState.currentCoin = nil
+            FarmState.lastCoinPos = nil
+            FarmState.pendingCoinPos = nil
+            FarmState.postWaitUntil = 0
+            FarmState.postSavedPos = nil
+            detachMovers()
+            detachSafeMovers()
+            FarmState.inSafeZone = false
+            FarmState.lastCoinAt = tick()
+        end)
+    end
+end)
+
+task.spawn(function()
+    while getgenv().MM2FarmLoaded do
+        task.wait(1)
+        local success, text = pcall(function()
+            return game:GetService("Players").LocalPlayer.PlayerGui.CrossPlatform.Halloween2026.MainEvent.Main.BattlePass.Title.Tokens.Container.TextLabel.Text
+        end)
+        if success and text then
+            FarmState.bpCoins = tonumber(text) or FarmState.bpCoins
+        end
+    end
+end)
+
+-- ТУТ БУДЕТ GUI (СКОРО)
+-- language: Lua, file: mm2_farm_gui.lua, target: MM2 (executor)
+
+local C = {
+    bg = Color3.fromRGB(15,15,15), bg2 = Color3.fromRGB(25,25,25),
+    bg3 = Color3.fromRGB(35,35,35), hover = Color3.fromRGB(45,45,45),
+    stroke = Color3.fromRGB(60,60,60), accent = Color3.fromRGB(100,200,255),
+    text = Color3.fromRGB(255,255,255), sub = Color3.fromRGB(150,150,150),
+    off = Color3.fromRGB(50,50,50), green = Color3.fromRGB(100,220,140),
+}
+local FONT_B, FONT_M = Enum.Font.GothamBold, Enum.Font.GothamMedium
+local function corner(p, r) local c = Instance.new("UICorner"); c.CornerRadius = r or UDim.new(0,6); c.Parent = p; return c end
+local function stroke(p)
+    local s = Instance.new("UIStroke"); s.Color = C.stroke; s.Transparency = 0.5; s.Thickness = 1
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; s.Parent = p; return s
+end
+
+local antiflingConn = nil
+local function startAntiFling()
+    if antiflingConn then return end
+    antiflingConn = RunService.Stepped:Connect(function()
+        local c = LP.Character
+        if not c then return end
+        local hrp = c:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        for _, obj in ipairs(hrp:GetChildren()) do
+            if obj:IsA("BodyVelocity") and obj.Name ~= "MM2Farm_BV" then
+                pcall(function() obj:Destroy() end)
+            elseif obj:IsA("BodyAngularVelocity") or obj:IsA("RocketPropulsion") then
+                pcall(function() obj:Destroy() end)
+            end
+        end
+    end)
+end
+local function stopAntiFling()
+    if antiflingConn then antiflingConn:Disconnect(); antiflingConn = nil end
+end
+
+local function buildGUI()
+    
+    local parent = (gethui and gethui()) or game:GetService("CoreGui")
+    if not parent then parent = LP:WaitForChild("PlayerGui") end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "MM2FarmGUI"; gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.DisplayOrder = 999
+    pcall(function() gui.Parent = parent end)
+    if not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
+
+    local notifGui = Instance.new("ScreenGui")
+    notifGui.Name = "MM2Farm_Notify"; notifGui.ResetOnSpawn = false
+    notifGui.IgnoreGuiInset = true
+    pcall(function() notifGui.Parent = parent end)
+    if not notifGui.Parent then notifGui.Parent = LP:WaitForChild("PlayerGui") end
+    notifyGui = function(msg, dur)
+        task.spawn(function()
+            local f = Instance.new("Frame")
+            f.Size = UDim2.new(0,320,0,46); f.Position = UDim2.new(0.5,-160,0.8,0)
+            f.BackgroundColor3 = C.bg2; f.BackgroundTransparency = 0.1; f.BorderSizePixel = 0
+            f.Parent = notifGui; corner(f, UDim.new(0,10))
+            local s = stroke(f); s.Color = C.green
+            local l = Instance.new("TextLabel")
+            l.Size = UDim2.new(1,-16,1,0); l.Position = UDim2.fromOffset(8,0)
+            l.BackgroundTransparency = 1; l.Text = msg; l.TextColor3 = C.text
+            l.Font = FONT_M; l.TextSize = 13; l.TextWrapped = true; l.Parent = f
+            task.wait(dur); f:Destroy()
+        end)
+    end
+
+    -- ══════════════════════════════════════════════
+    -- HUD: ТОЛЬКО Всего конфет, Время, Статус, БП
+    -- ══════════════════════════════════════════════
+    local hudGui = Instance.new("ScreenGui")
+    hudGui.Name = "MM2Farm_HUD"; hudGui.ResetOnSpawn = false
+    hudGui.IgnoreGuiInset = true; hudGui.DisplayOrder = 1000
+    pcall(function() hudGui.Parent = parent end)
+    if not hudGui.Parent then hudGui.Parent = LP:WaitForChild("PlayerGui") end
+
+    local hudFrame = Instance.new("Frame")
+    hudFrame.Size = UDim2.new(0, 280, 0, 75); hudFrame.Position = UDim2.new(0.5, -140, 0, 10)
+    hudFrame.BackgroundColor3 = Color3.fromRGB(10, 10, 10); hudFrame.BackgroundTransparency = 0.3
+    hudFrame.BorderSizePixel = 0; hudFrame.Parent = hudGui
+    corner(hudFrame, UDim.new(0, 8))
+    local hudStroke = Instance.new("UIStroke"); hudStroke.Color = Color3.fromRGB(80, 80, 80); hudStroke.Thickness = 1; hudStroke.Transparency = 0.5; hudStroke.Parent = hudFrame
+
+    local hudLbl = Instance.new("TextLabel")
+    hudLbl.Size = UDim2.new(1, -10, 1, -10); hudLbl.Position = UDim2.new(0, 5, 0, 5)
+    hudLbl.BackgroundTransparency = 1; hudLbl.TextColor3 = C.text
+    hudLbl.Font = Enum.Font.Code; hudLbl.TextSize = 13
+    hudLbl.TextXAlignment = Enum.TextXAlignment.Center; hudLbl.TextYAlignment = Enum.TextYAlignment.Center
+    hudLbl.Text = "Загрузка..."; hudLbl.Parent = hudFrame
+
+    task.spawn(function()
+        while hudGui.Parent do
+            task.wait(0.5)
+            local totalCoins = Config.TotalCoins or 0
+            local totalTime = Config.TotalTime or 0
+            
+            local hours = math.floor(totalTime / 3600)
+            local mins = math.floor((totalTime % 3600) / 60)
+            local timeStr = string.format("%02d:%02d", hours, mins)
+            
+            local phaseMap = {
+                idle = "Ожидание", wait = "Спрятан", farm = "Фарм", post = "Пост-фарм"
+            }
+            local phaseStr = phaseMap[FarmState.phase] or FarmState.phase
+            
+            local bpStr = FarmState.bpCoins > 0 and tostring(FarmState.bpCoins) or "..."
+            
+            hudLbl.Text = string.format(
+                "🪙 Всего: %d  |  ⏱ Время: %s\n🎃 БП: %s\n⚙️ Статус: %s", 
+                totalCoins, timeStr, bpStr, phaseStr
+            )
+            
+            if FarmState.phase == "post" then hudLbl.TextColor3 = Color3.fromRGB(255, 200, 100)
+            elseif FarmState.phase == "farm" then hudLbl.TextColor3 = Color3.fromRGB(150, 255, 150)
+            else hudLbl.TextColor3 = Color3.fromRGB(200, 200, 200) end
+        end
+    end)
+
+    local main = Instance.new("Frame")
+    main.Size = UDim2.fromOffset(420,600); main.Position = UDim2.new(0.5,-210,0.5,-300)
+    main.BackgroundColor3 = C.bg; main.BorderSizePixel = 0
+    main.ClipsDescendants = true; main.Visible = false; main.Parent = gui
+    corner(main, UDim.new(0,10)); stroke(main)
+
+    local header = Instance.new("Frame")
+    header.Size = UDim2.new(1,0,0,44); header.BackgroundColor3 = C.bg2; header.BorderSizePixel = 0; header.Parent = main
+    local hl = Instance.new("Frame")
+    hl.Size = UDim2.new(1,0,0,1); hl.Position = UDim2.new(0,0,1,-1); hl.BackgroundColor3 = C.stroke
+    hl.BackgroundTransparency = 0.5; hl.BorderSizePixel = 0; hl.Parent = header
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1,-70,1,0); title.Position = UDim2.fromOffset(16,0); title.BackgroundTransparency = 1
+    title.Text = "MM2 FARM [RU]"; title.Font = FONT_B; title.TextSize = 15; title.TextColor3 = C.text
+    title.TextXAlignment = Enum.TextXAlignment.Left; title.Parent = header
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.fromOffset(28,28); closeBtn.Position = UDim2.new(1,-38,0.5,-14); closeBtn.BackgroundColor3 = C.bg3
+    closeBtn.AutoButtonColor = false; closeBtn.Text = "×"; closeBtn.Font = FONT_B; closeBtn.TextSize = 16
+    closeBtn.TextColor3 = C.text; closeBtn.Parent = header
+    corner(closeBtn, UDim.new(0,6)); stroke(closeBtn)
+
+    do
+        local dragging, ds, sp = false, nil, nil
+        header.InputBegan:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+                dragging = true; ds = i.Position; sp = main.Position
+            end
+        end)
+        UserInputService.InputChanged:Connect(function(i)
+            if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+                local d = i.Position - ds
+                main.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
+            end
+        end)
+        UserInputService.InputEnded:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end)
+    end
+
+    local tooltipFrame = Instance.new("Frame")
+    tooltipFrame.Size = UDim2.new(1, 0, 0, 30); tooltipFrame.Position = UDim2.new(0, 0, 1, -30)
+    tooltipFrame.BackgroundColor3 = C.bg2; tooltipFrame.BorderSizePixel = 0
+    tooltipFrame.BackgroundTransparency = 0.2
+    tooltipFrame.Parent = main
+    local tooltipLbl = Instance.new("TextLabel")
+    tooltipLbl.Size = UDim2.new(1, -10, 1, 0); tooltipLbl.Position = UDim2.new(0, 5, 0, 0)
+    tooltipLbl.BackgroundTransparency = 1; tooltipLbl.Text = "Наведи на настройку для описания"
+    tooltipLbl.Font = FONT_M; tooltipLbl.TextSize = 11; tooltipLbl.TextColor3 = C.sub
+    tooltipLbl.TextXAlignment = Enum.TextXAlignment.Left; tooltipLbl.TextTruncate = Enum.TextTruncate.AtEnd
+    tooltipLbl.Parent = tooltipFrame
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1,-16,1,-80); scroll.Position = UDim2.fromOffset(8,50); scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel = 0; scroll.ScrollBarThickness = 3; scroll.ScrollBarImageColor3 = C.accent
+    scroll.CanvasSize = UDim2.new(); scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y; scroll.Parent = main
+
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0,6); list.SortOrder = Enum.SortOrder.LayoutOrder; list.Parent = scroll
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop = UDim.new(0,4); pad.PaddingBottom = UDim.new(0,8); pad.PaddingRight = UDim.new(0,6); pad.Parent = scroll
+
+    local order = 0
+    local function nextO() order = order + 1; return order end
+    
+    local function newRow(h, hint)
+        local r = Instance.new("Frame")
+        r.Size = UDim2.new(1,0,0,h); r.BackgroundColor3 = C.bg2; r.BorderSizePixel = 0
+        r.LayoutOrder = nextO(); r.Parent = scroll; corner(r, UDim.new(0,6)); stroke(r)
+        
+        r.MouseEnter:Connect(function() tooltipLbl.Text = hint or "" end)
+        r.MouseLeave:Connect(function() tooltipLbl.Text = "Наведи на настройку для описания" end)
+        
+        return r
+    end
+    
+    local function section(text)
+        local l = Instance.new("TextLabel")
+        l.Size = UDim2.new(1,0,0,22); l.BackgroundTransparency = 1; l.Text = string.upper(text)
+        l.Font = FONT_B; l.TextSize = 11; l.TextColor3 = C.sub; l.TextXAlignment = Enum.TextXAlignment.Left
+        l.LayoutOrder = nextO(); l.Parent = scroll
+        local p = Instance.new("UIPadding"); p.PaddingLeft = UDim.new(0,4); p.PaddingTop = UDim.new(0,6); p.Parent = l
+    end
+    
+    local function toggle(name, key, hint, cb)
+        if Config[key] == nil then Config[key] = false end
+        local row = newRow(38, hint)
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1,-70,1,0); lbl.Position = UDim2.fromOffset(12,0); lbl.BackgroundTransparency = 1
+        lbl.Text = name; lbl.Font = FONT_M; lbl.TextSize = 13; lbl.TextColor3 = C.text; lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = row
+        local track = Instance.new("TextButton")
+        track.Size = UDim2.fromOffset(40,20); track.Position = UDim2.new(1,-52,0.5,-10); track.AutoButtonColor = false
+        track.Text = ""; track.BorderSizePixel = 0; track.Parent = row; corner(track, UDim.new(1,0)); stroke(track)
+        local knob = Instance.new("Frame")
+        knob.Size = UDim2.fromOffset(14,14); knob.BorderSizePixel = 0; knob.Parent = track; corner(knob, UDim.new(1,0))
+        
+        local function render()
+            local on = Config[key]
+            track.BackgroundColor3 = on and C.accent or C.off
+            knob.BackgroundColor3 = on and C.bg or C.sub
+            knob.Position = on and UDim2.new(1,-17,0.5,-7) or UDim2.new(0,3,0.5,-7)
+        end
+        render()
+        track.MouseButton1Click:Connect(function()
+            Config[key] = not Config[key]; render(); saveConfig(); if cb then pcall(cb, Config[key]) end
+        end)
+    end
+    
+    local function inputSlider(name, key, min, max, dec, hint)
+        dec = dec or 0
+        if Config[key] == nil then Config[key] = min end
+        Config[key] = tonumber(Config[key]) or min
+        local mult = 10^dec
+        local row = newRow(52, hint)
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1,-80,0,22); lbl.Position = UDim2.fromOffset(12,4); lbl.BackgroundTransparency = 1
+        lbl.Text = name; lbl.Font = FONT_M; lbl.TextSize = 13; lbl.TextColor3 = C.text; lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = row
+        
+        local txt = Instance.new("TextBox")
+        txt.Size = UDim2.fromOffset(60,22); txt.Position = UDim2.new(1,-72,0,4)
+        txt.BackgroundTransparency = 1; txt.Font = FONT_M; txt.TextSize = 12; txt.TextColor3 = C.sub
+        txt.TextXAlignment = Enum.TextXAlignment.Right; txt.Parent = row
+        txt.Text = tostring(Config[key])
+        txt.ClearTextOnFocus = false
+        
+        local bar = Instance.new("Frame")
+        bar.Size = UDim2.new(1,-24,0,4); bar.Position = UDim2.new(0,12,0,36); bar.BackgroundColor3 = C.bg3
+        bar.BorderSizePixel = 0; bar.Parent = row; corner(bar, UDim.new(1,0)); stroke(bar)
+        local fill = Instance.new("Frame")
+        fill.Size = UDim2.fromScale(0,1); fill.BackgroundColor3 = C.accent; fill.BorderSizePixel = 0; fill.Parent = bar; corner(fill, UDim.new(1,0))
+        local knob = Instance.new("Frame")
+        knob.Size = UDim2.fromOffset(12,12); knob.AnchorPoint = Vector2.new(0.5,0.5); knob.Position = UDim2.fromScale(0,0.5)
+        knob.BackgroundColor3 = C.text; knob.BorderSizePixel = 0; knob.Parent = bar; corner(knob, UDim.new(1,0)); stroke(knob)
+        local hit = Instance.new("TextButton")
+        hit.Size = UDim2.new(1,0,0,24); hit.Position = UDim2.new(0,0,0,26); hit.BackgroundTransparency = 1; hit.Text = ""; hit.Parent = row
+        
+        local function setV(v, save)
+            v = math.clamp(math.floor(v*mult+0.5)/mult, min, max)
+            Config[key] = v
+            local f = (v - min) / (max - min)
+            txt.Text = tostring(v); fill.Size = UDim2.fromScale(f,1); knob.Position = UDim2.fromScale(f,0.5)
+            if save then saveConfig() end
+        end
+        setV(Config[key], false)
+        
+        local drag = false
+        local function fromInput(inp)
+            if not main.Visible then return end
+            local f = math.clamp((inp.Position.X - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+            setV(min + (max - min) * f, false)
+        end
+        hit.InputBegan:Connect(function(inp) if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then drag = true; fromInput(inp) end end)
+        UserInputService.InputChanged:Connect(function(inp) if drag and main.Visible and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then fromInput(inp) end end)
+        UserInputService.InputEnded:Connect(function(inp) if drag and (inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch) then drag = false; saveConfig() end end)
+        
+        txt.FocusLost:Connect(function()
+            local num = tonumber(txt.Text)
+            if num then
+                setV(num, true)
+            else
+                setV(Config[key], false)
+            end
+        end)
+    end
+    
+    local function btn(name, hint, cb)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1,0,0,36); b.BackgroundColor3 = C.bg3; b.AutoButtonColor = false
+        b.Text = name; b.Font = FONT_M; b.TextSize = 13; b.TextColor3 = C.text; b.BorderSizePixel = 0
+        b.LayoutOrder = nextO(); b.Parent = scroll; corner(b, UDim.new(0,6)); stroke(b)
+        
+        b.MouseEnter:Connect(function() tooltipLbl.Text = hint or "" end)
+        b.MouseLeave:Connect(function() tooltipLbl.Text = "Наведи на настройку для описания" end)
+        
+        b.MouseButton1Click:Connect(function() if cb then task.spawn(cb) end end)
+        return b
+    end
+
+    section("Фарм")
+    toggle("АВТО-ФАРМ", "AutoFarm", "Включает и выключает автоматический сбор монет", function(v) if v then startFarm() else stopFarm() end end)
+    inputSlider("Скорость", "FlightSpeed", 5, 120, 0, "Скорость полета к конфетам (в студах)")
+    inputSlider("Задержка", "CoinStayTime", 0, 10, 2, "Время зависания на конфете после подбора (0 = мгновенно)")
+    inputSlider("Глубина", "CoinOffset", 0, 10, 1, "Насколько студов под конфетой он должен остановиться")
+
+    section("Сейв-зона")
+    inputSlider("Глубина сейва", "SafeDepth", 10, 500, 0, "На сколько студов ниже текущей позиции уходить в сейв между раундами.")
+
+    section("После лимита (Пост-фарм)")
+    toggle("Пост-фарм", "PostFarmAuto", "Включает действия после сбора лимита (стрельба или ресет)")
+    toggle("За спиной", "StickyBehind", "Прилипать к мардеру со спины для выстрела")
+    inputSlider("Задержка выстрела", "ShotInterval", 0.1, 2, 2, "Интервал между выстрелами")
+    toggle("Подбирать пушку", "AutoGrabGun", "Пытаться подобрать выпавший пистолет во время фарма")
+    inputSlider("Дист. до мардера", "GunSafeDist", 1, 100, 0, "Безопасное расстояние до мардера (если ближе - скрипт не подберет пушку)")
+    inputSlider("Макс. дист. до пушки", "MaxGunDistance", 50, 2000, 0, "На каком расстоянии скрипт увидит и полетит за пушкой")
+
+    section("Автоматизация и Свап")
+    toggle("Анти-АФК", "AntiAFK", "Предотвращает кик за неактивность", function(v) Config.AntiAFK = v; saveConfig(); if v then startAntiAFK() else stopAntiAFK() end end)
+    toggle("Анти-Флинг", "AntiFling", "Защита от подбрасывания других игроков", function(v) Config.AntiFling = v; saveConfig(); if v then startAntiFling() else stopAntiFling() end end)
+    toggle("Авто-Реконнект", "RejoinEnabled", "Перезаход по таймеру")
+    inputSlider("Время реконнекта", "AutoRejoinMin", 1, 180, 0, "Через сколько минут сделать перезаход")
+    toggle("Свап при ошибке", "HopOnError", "Автоматически менять сервер при кике или ошибке")
+    inputSlider("Задержка свапа", "ReconnectDelay", 2, 20, 0, "Секунд перед тем как начать искать новый сервер")
+    inputSlider("Свапать если игроков >", "HopTriggerPlayers", 1, 12, 0, "Если на сервере станет больше людей - скрипт уйдет")
+    inputSlider("Искать сервер до", "HopSearchMaxPlayers", 1, 12, 0, "Скрипт будет искать сервера, где игроков НЕ БОЛЬШЕ чем это число")
+
+    section("Оптимизация")
+    toggle("Черный экран", "NoRender", "Отключает 3D графику (экономит ресурсы ПК)", function(v) setNoRender(v) end)
+    toggle("Убрать текстуры", "TextureStrip", "Удаляет текстуры карт и предметов")
+    toggle("Убрать свет", "LightingOpt", "Убирает тени и освещение")
+    toggle("FFlags (FPS)", "FFlags", "Включает скрытые настройки Roblox для повышения FPS")
+
+    section("Конфиг")
+    btn("СОХРАНИТЬ", "Принудительно сохраняет текущие настройки в файл", function() if saveConfig() then notifyGui("Сохранено", 2) else notifyGui("Ошибка", 2) end end)
+    btn("СБРОСИТЬ СТАТЫ", "Обнуляет общий счетчик монет и времени", function()
+        Config.TotalCoins = 0; Config.TotalTime = 0; saveConfig(); notifyGui("Статистика сброшена", 2)
+    end)
+    btn("ВЫГРУЗИТЬ", "Полностью выключает скрипт и удаляет интерфейс", function()
+        saveConfig()
+        pcall(stopFarm); pcall(stopAntiAFK); pcall(stopAntiFling); pcall(stopOptimize)
+        if noRenderGui then pcall(function() noRenderGui:Destroy() end) end
+        pcall(function() gui:Destroy() end); pcall(function() notifGui:Destroy() end)
+        pcall(function() hudGui:Destroy() end)
+        getgenv().MM2FarmLoaded = nil
+    end)
+
+    local openBtn = Instance.new("TextButton")
+    openBtn.Size = UDim2.fromOffset(48,48); openBtn.Position = UDim2.new(0.85,0,0.85,0)
+    openBtn.BackgroundColor3 = C.bg2; openBtn.AutoButtonColor = false
+    openBtn.Text = "🌾"; openBtn.Font = FONT_B; openBtn.TextSize = 22
+    openBtn.TextColor3 = C.text; openBtn.BorderSizePixel = 0; openBtn.Parent = gui
+    corner(openBtn, UDim.new(1,0)); stroke(openBtn)
+    
+    local wasMoved = (function()
+        local dragging, ds, sp, moved = false, nil, nil, false
+        openBtn.InputBegan:Connect(function(inp)
+            if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+                dragging, moved = true, false; ds = inp.Position; sp = openBtn.Position
+            end
+        end)
+        UserInputService.InputChanged:Connect(function(inp)
+            if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+                local d = inp.Position - ds
+                if d.Magnitude > 4 then moved = true end
+                openBtn.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
+            end
+        end)
+        UserInputService.InputEnded:Connect(function(inp)
+            if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end)
+        return function() return moved end
+    end)()
+    
+    local function setMenu(s) main.Visible = s; openBtn.Visible = not s end
+    closeBtn.MouseButton1Click:Connect(function() setMenu(false) end)
+    openBtn.MouseButton1Click:Connect(function() if not wasMoved() then setMenu(true) end end)
+    setMenu(false)
+    UserInputService.InputBegan:Connect(function(inp, gp)
+        if gp then return end
+        if UserInputService:GetFocusedTextBox() then return end
+        if inp.KeyCode == Enum.KeyCode["F1"] then setMenu(not main.Visible) end
+    end)
+    getgenv().MM2Farm_hudGui = hudGui
+    getgenv().MM2Farm_notifGui = notifGui
+    return gui
+end
+if getgenv().MM2FarmLoaded then
+    if getgenv().MM2FarmUnload then pcall(getgenv().MM2FarmUnload) end
+end
+getgenv().MM2FarmLoaded = true
+local mainGui = buildGUI()
+getgenv().MM2FarmUnload = function()
+    saveConfig()
+    pcall(stopFarm); pcall(stopAntiAFK); pcall(stopAntiFling); pcall(stopOptimize)
+    pcall(function() mainGui:Destroy() end)
+    if getgenv().MM2Farm_hudGui then pcall(function() getgenv().MM2Farm_hudGui:Destroy() end); getgenv().MM2Farm_hudGui = nil end
+    if getgenv().MM2Farm_notifGui then pcall(function() getgenv().MM2Farm_notifGui:Destroy() end); getgenv().MM2Farm_notifGui = nil end
+    getgenv().MM2FarmLoaded = nil
+end
+
+if Config.NoRender then setNoRender(true) end
+if Config.AntiAFK then startAntiAFK() end
+if Config.AntiFling then startAntiFling() end
+startOptimize()
+if Config.AutoFarm then task.delay(2, startFarm) end
+notifyGui("MM2Farm v11 загружен. Нажми F1", 3)
+print("[MM2Farm v11] ready")
