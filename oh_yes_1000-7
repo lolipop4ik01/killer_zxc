@@ -46,6 +46,7 @@ local Config = {
     AutoRejoinMin = 20,
     RejoinEnabled = true,
     lastTeleportFromJobId = "",
+    lastTeleportAt = 0,
     serverBlacklist = {},
     
     NoRender = false,
@@ -101,6 +102,11 @@ local function loadConfig()
     end
 end
 loadConfig()
+-- минимум 4 минуты, чтобы не триггерить idle-swap во время раунда
+if (Config.IdleFarmTimeout or 0) < 240 then
+    Config.IdleFarmTimeout = 240
+    warn("[CFG] IdleFarmTimeout forced to 240 (was less)")
+end
 
 local FarmState = {
     running = false, conn = nil,
@@ -186,6 +192,7 @@ local function doReconnect(forceHop)
     -- запоминаем сервер, С КОТОРОГО уходим, чтобы детектить возврат
     if game.JobId and game.JobId ~= "" then
         Config.lastTeleportFromJobId = game.JobId
+        Config.lastTeleportAt = tick()
     end
 
     if forceHop and game.JobId and game.JobId ~= "" then
@@ -957,21 +964,27 @@ local function startFarm()
     FarmState.lastHRPPos = hrp.Position
     FarmState.lastTeleportAt = 0
 
-    -- детект возврата на тот же сервер
-    if Config.lastTeleportFromJobId == game.JobId and game.JobId ~= "" then
+    -- детект возврата на тот же сервер (только если свап был <120 сек назад)
+    local swapRecent = Config.lastTeleportAt and Config.lastTeleportAt > 0 
+        and (tick() - Config.lastTeleportAt) < 120
+    if Config.lastTeleportFromJobId == game.JobId 
+        and game.JobId ~= "" 
+        and swapRecent then
         warn("[SWAP] returned to SAME server " .. game.JobId .. " — retry in 90s")
-        Config.lastTeleportFromJobId = ""  -- сброс, чтобы не зациклиться навсегда
+        Config.lastTeleportFromJobId = ""
+        Config.lastTeleportAt = 0
         saveConfig()
         task.delay(90, function()
             if FarmState.running and Config.AutoFarm then
-                FarmState.lastHopAt = 0  -- снять блокировку 8 сек в monitorServers
+                FarmState.lastHopAt = 0
                 warn("[SWAP] retrying hop after same-server detection")
                 doReconnect(true)
             end
         end)
     else
-        -- успешный свап на новый сервер
+        -- нормальный запуск или успешный свап на новый сервер
         Config.lastTeleportFromJobId = ""
+        Config.lastTeleportAt = 0
         saveConfig()
     end
     FarmState.lastCoinAt = tick()
@@ -1093,7 +1106,7 @@ end
 
 task.spawn(function()
     warn("[MON] loop started")
-    while getgenv().MM2FarmLoaded do
+    while getgenv().MM2FarmLoaded ~= false do
         task.wait(2)
         local ok, err = pcall(monitorServers)
         if not ok then warn("[MON] error: " .. tostring(err)) end
@@ -1517,6 +1530,7 @@ local function buildGUI()
     inputSlider("Время реконнекта", "AutoRejoinMin", 1, 180, 0, "Через сколько минут сделать перезаход")
     toggle("Свап при ошибке", "HopOnError", "Автоматически менять сервер при кике или ошибке")
     inputSlider("Задержка свапа", "ReconnectDelay", 2, 20, 0, "Секунд перед тем как начать искать новый сервер")
+    inputSlider("Idle до свапа (сек)", "IdleFarmTimeout", 240, 600, 0, "Секунд без монет — свап. Минимум 240 (4 мин): раунд 3 мин + загрузка.")
     inputSlider("Свапать если игроков >", "HopTriggerPlayers", 1, 12, 0, "Если на сервере станет больше людей - скрипт уйдет")
     inputSlider("Искать сервер до", "HopSearchMaxPlayers", 1, 12, 0, "Скрипт будет искать сервера, где игроков НЕ БОЛЬШЕ чем это число")
 
@@ -1537,7 +1551,7 @@ local function buildGUI()
         if noRenderGui then pcall(function() noRenderGui:Destroy() end) end
         pcall(function() gui:Destroy() end); pcall(function() notifGui:Destroy() end)
         pcall(function() hudGui:Destroy() end)
-        getgenv().MM2FarmLoaded = nil
+        getgenv().MM2FarmLoaded = false
     end)
 
     local openBtn = Instance.new("TextButton")
@@ -1593,7 +1607,7 @@ getgenv().MM2FarmUnload = function()
     pcall(function() mainGui:Destroy() end)
     if getgenv().MM2Farm_hudGui then pcall(function() getgenv().MM2Farm_hudGui:Destroy() end); getgenv().MM2Farm_hudGui = nil end
     if getgenv().MM2Farm_notifGui then pcall(function() getgenv().MM2Farm_notifGui:Destroy() end); getgenv().MM2Farm_notifGui = nil end
-    getgenv().MM2FarmLoaded = nil
+    getgenv().MM2FarmLoaded = false
 end
 
 if Config.NoRender then setNoRender(true) end
