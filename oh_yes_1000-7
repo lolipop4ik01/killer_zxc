@@ -119,9 +119,9 @@ if (Config.IdleFarmTimeout or 0) < 240 then
     warn("[CFG] IdleFarmTimeout forced to 240 (was less)")
 end
 -- BehindOffset минимум 8: дуло = handle + 2.5 forward, иначе дуло внутри мардера
-if (Config.BehindOffset or 0) < 8 then
-    Config.BehindOffset = 8
-    warn("[CFG] BehindOffset forced to 8 (was less than 8)")
+if (Config.BehindOffset or 0) < 2 then
+    Config.BehindOffset = 2
+    warn("[CFG] BehindOffset forced to 2 (was less than 2)")
 end
 
 local FarmState = {
@@ -424,10 +424,21 @@ local function blacklistCheck(coin)
     return false
 end
 
+local _ccCache = { cc = nil, at = 0, ttl = 5 }
 local function findCoinContainer()
+    local now = tick()
+    if _ccCache.cc and _ccCache.cc.Parent and now - _ccCache.at < _ccCache.ttl then
+        return _ccCache.cc
+    end
     local cc = WS:FindFirstChild("CoinContainer", true)
-    if cc then return cc end
-    for _, d in ipairs(WS:GetDescendants()) do if d.Name == "CoinContainer" then return d end end
+    if not cc then
+        for _, d in ipairs(WS:GetDescendants()) do 
+            if d.Name == "CoinContainer" then cc = d break end 
+        end
+    end
+    _ccCache.cc = cc
+    _ccCache.at = now
+    return cc
 end
 local function isCoinLive(c)
     if not c or not c.Parent then return false end
@@ -437,11 +448,26 @@ local function isCoinLive(c)
     if blacklistCheck(c) then return false end
     return true
 end
+local _coinsCache = { list = {}, at = 0, ttl = 0.2 }
 local function getAllCoins()
+    local now = tick()
+    if now - _coinsCache.at < _coinsCache.ttl then
+        return _coinsCache.list
+    end
     local out = {}
     local cc = findCoinContainer()
-    if not cc then return out end
-    for _, c in ipairs(cc:GetChildren()) do if c:IsA("BasePart") and c.Name == "Coin_Server" and isCoinLive(c) then out[#out+1] = c end end
+    if not cc then
+        _coinsCache.list = out
+        _coinsCache.at = now
+        return out
+    end
+    for _, c in ipairs(cc:GetChildren()) do 
+        if c:IsA("BasePart") and c.Name == "Coin_Server" and isCoinLive(c) then 
+            out[#out+1] = c 
+        end 
+    end
+    _coinsCache.list = out
+    _coinsCache.at = now
     return out
 end
 local function getNearestCoin(fromPos)
@@ -558,25 +584,42 @@ local function getMyRole()
     return nil
 end
 
+local _murdCache = { player = nil, at = 0, ttl = 0.7 }
+local _murdRemote = nil
 local function getMurd()
-    local ok, rd = pcall(function()
+    local now = tick()
+    if _murdCache.player and now - _murdCache.at < _murdCache.ttl then
+        return _murdCache.player
+    end
+    if not _murdRemote then
         local r = ReplicatedStorage:FindFirstChild("GetPlayerData", true)
-        if r and r:IsA("RemoteFunction") then return r:InvokeServer() end
-    end)
-    if ok and type(rd) == "table" then
-        for name, info in pairs(rd) do
-            if info.Role == "Murderer" and not info.Killed and not info.Dead then
-                local p = Players:FindFirstChild(name)
-                if p and p ~= LP and p.Character then return p end
+        if r and r:IsA("RemoteFunction") then _murdRemote = r end
+    end
+    local result = nil
+    if _murdRemote then
+        local ok, rd = pcall(function() return _murdRemote:InvokeServer() end)
+        if ok and type(rd) == "table" then
+            for name, info in pairs(rd) do
+                if info.Role == "Murderer" and not info.Killed and not info.Dead then
+                    local p = Players:FindFirstChild(name)
+                    if p and p ~= LP and p.Character then result = p break end
+                end
             end
         end
     end
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LP and p.Character then
-            local bp = p:FindFirstChild("Backpack")
-            if (bp and bp:FindFirstChild("Knife")) or p.Character:FindFirstChild("Knife") then return p end
+    if not result then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LP and p.Character then
+                local bp = p:FindFirstChild("Backpack")
+                if (bp and bp:FindFirstChild("Knife")) or p.Character:FindFirstChild("Knife") then
+                    result = p break
+                end
+            end
         end
     end
+    _murdCache.player = result
+    _murdCache.at = now
+    return result
 end
 local function getGunTool()
     local c = LP.Character
@@ -621,7 +664,12 @@ local function isInsideCharacter(inst)
     return false
 end
 
+local _gunCache = { parts = nil, obj = nil, at = 0, ttl = 0.4 }
 local function findGunDropParts()
+    local now = tick()
+    if now - _gunCache.at < _gunCache.ttl then
+        return _gunCache.parts, _gunCache.obj
+    end
     -- 1) прямой потомок workspace с именем GunDrop, лежащий на земле
     -- 2) рекурсивно (Mansion2.GunDrop), но НЕ в character и НЕ в Backpack
     local obj = nil
@@ -644,19 +692,20 @@ local function findGunDropParts()
         end
     end
 
-    -- потом рекурсивно
+    -- потом по всем текущим картам (верхний уровень workspace, потом их дети)
     if not obj then
-        for _, c in ipairs(WS:GetDescendants()) do
-            if c.Name == "GunDrop" and isDroppedGun(c) then
-                obj = c
-                break
+        for _, top in ipairs(WS:GetChildren()) do
+            if top.Name == "GunDrop" and isDroppedGun(top) then obj = top break end
+            if top:IsA("Model") then
+                local g = top:FindFirstChild("GunDrop")
+                if g and isDroppedGun(g) then obj = g break end
             end
         end
     end
 
-    -- последний вариант: Tool с "gun" в имени, но точно не в character / не в Backpack
+    -- последний вариант: Tool с "gun" в имени (только прямые дети)
     if not obj then
-        for _, c in ipairs(WS:GetDescendants()) do
+        for _, c in ipairs(WS:GetChildren()) do
             if c:IsA("Tool") and c.Name:lower():find("gun") and isDroppedGun(c) then
                 obj = c
                 break
@@ -682,6 +731,9 @@ local function findGunDropParts()
         end
     end
 
+    _gunCache.parts = parts
+    _gunCache.obj = obj
+    _gunCache.at = now
     return parts, obj
 end
 
@@ -761,41 +813,32 @@ local function postFarmStep(hrp)
                         local targetPos = mHRP2.Position
                         local lookDir = mHRP2.CFrame.LookVector
 
-                        -- teleport BEHIND murderer (BehindOffset >= 8)
+                        -- teleport ВПЛОТНУЮ за мардера (BehindOffset = 2)
                         local behind = targetPos - lookDir * Config.BehindOffset
                         h.CFrame = CFrame.lookAt(behind, targetPos)
                         h.AssemblyLinearVelocity = Vector3.zero
                         h.AssemblyAngularVelocity = Vector3.zero
 
+                        -- 3 кадра чтобы сервер увидел позицию
+                        task.wait()
                         task.wait()
                         task.wait()
 
-                        -- RE-READ muzzle from gun handle AFTER teleport
-                        local muzzlePos = nil
-                        local handle = g:FindFirstChild("Handle")
-                        if handle and handle:IsA("BasePart") then
-                            muzzlePos = handle.Position + handle.CFrame.LookVector * 2.5 + Vector3.new(0, 0.5, 0)
-                        end
-                        if not muzzlePos then
-                            for _, obj in ipairs(g:GetDescendants()) do
-                                if obj:IsA("Attachment") and obj.Name:lower():find("raycast") then
-                                    muzzlePos = obj.WorldPosition
-                                    break
-                                end
-                            end
-                        end
-                        if not muzzlePos then
-                            muzzlePos = h.Position + h.CFrame.LookVector * 2.5 + Vector3.new(0, 1, 0)
-                        end
-
-                        -- RE-READ target (murderer could move slightly)
+                        -- RE-READ target (свежая позиция мардера)
                         local freshMHRP = targetChar:FindFirstChild("HumanoidRootPart")
                         local freshPos = freshMHRP and freshMHRP.Position or targetPos
                         -- velocity prediction
                         if freshMHRP then
                             local vel = freshMHRP.AssemblyLinearVelocity
-                            freshPos = freshPos + vel * 0.05
+                            freshPos = freshPos + vel * 0.03
                         end
+
+                        -- muzzle = моя позиция + 1 студ в сторону мардера
+                        -- т.е. дуло физически в мардере, промах невозможен
+                        local myPos = h.Position
+                        local dirToMurd = (freshPos - myPos)
+                        local dirUnit = dirToMurd.Magnitude > 0.1 and dirToMurd.Unit or lookDir
+                        local muzzlePos = myPos + dirUnit * 1
 
                         -- find remote
                         local shootEv = g:FindFirstChild("Shoot")
@@ -1017,11 +1060,15 @@ if Config.AutoGrabGun and not hasGun() and not FarmState.gunGrabInProgress then
         local distToGun = (gd.Position - pos).Magnitude
         local safe, distToMurd = canSafelyGrab(gd.Position)
 
-        if not FarmState._lastGunLog or now - FarmState._lastGunLog > 2 then
+        -- лог только при смене состояния (safe → not safe) или если 10 сек не писали
+        local stateKey = tostring(safe) .. "_" .. tostring(#allParts)
+        if FarmState._lastGunState ~= stateKey 
+           or not FarmState._lastGunLog 
+           or now - FarmState._lastGunLog > 10 then
+            FarmState._lastGunState = stateKey
             FarmState._lastGunLog = now
-            warn(string.format("[GUN] parts=%d dist=%.0f safe=%s distMurd=%.0f retryIn=%.1fs",
-                #allParts, distToGun, tostring(safe), distToMurd,
-                math.max(0, (FarmState.gunRetryAt or 0) - now)))
+            warn(string.format("[GUN] parts=%d dist=%.0f safe=%s distMurd=%.0f",
+                #allParts, distToGun, tostring(safe), distToMurd))
         end
 
         -- условия: safe (мардер >= GunSafeDist) + в радиусе + прошло 3с с прошлой попытки
@@ -1346,9 +1393,6 @@ local function monitorServers()
         return
     end
 end
-
-local MY_TOKEN = tostring(tick()) .. "_" .. tostring(math.random(100000, 999999))
-getgenv().MM2FarmActiveToken = MY_TOKEN
 
 task.spawn(function()
     warn("[MON] loop started (token=" .. MY_TOKEN .. ")")
