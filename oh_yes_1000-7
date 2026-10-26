@@ -1242,15 +1242,19 @@ end
 if FarmState.currentCoin then
     if not FarmState.currentCoin.Parent or not isCoinLive(FarmState.currentCoin) then
         blacklistAdd(FarmState.currentCoin)
-        -- различаем: я подобрал (был близко) или чужой (был далеко)
-        local myDist = FarmState.lastCoinDist
-        if myDist and myDist < 15 then
-            -- я подобрал → задержка
+        -- fireTouch вызывается только при dist < 10. Если монета исчезла
+        -- пока мы были ближе 10 студов — это почти всегда наш fireTouch.
+        -- Ставим lastCollectAt СИНХРОННО, чтобы CoinStayTime применился
+        -- сразу. Асинхронная проверка через 0.25с запаздывала — персонаж
+        -- успевал пролететь вперёд и только потом стопорился, юзер видел
+        -- "лишний стоп после задержки".
+        local myDist = FarmState.lastCoinDist or 999
+        if myDist < 10 then
             FarmState.lastCollectAt = now
             FarmState.lastCoinAt = now
             FarmState.lastRealFarmAt = now
         end
-        -- чужой подобрал → НЕ трогаем lastCollectAt, летим к следующей сразу
+        -- чужой подобрал → lastCollectAt НЕ трогаем, летим дальше
         FarmState.lastCoinPos = nil
         FarmState.pendingCoinPos = nil
         FarmState.lastCoinDist = nil
@@ -1259,12 +1263,13 @@ if FarmState.currentCoin then
         FarmState.targetSince = 0
     elseif now - FarmState.targetSince > 2.0 then
         blacklistAdd(FarmState.currentCoin)
-                blacklistAdd(FarmState.currentCoin)
-                FarmState.currentCoin = nil; FarmState.targetAttempts = 0; FarmState.targetSince = 0
-                if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
-                return
-            end
-        end
+        FarmState.currentCoin = nil
+        FarmState.targetAttempts = 0
+        FarmState.targetSince = 0
+        if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
+        return
+    end
+end
 
 if not FarmState.currentCoin or (now - FarmState.lastScan > 0.2) then
     FarmState.lastScan = now
@@ -1305,20 +1310,26 @@ if not FarmState.currentCoin or (now - FarmState.lastScan > 0.2) then
         
 if dist < 10 then
     FarmState.pendingCoinPos = target.Position - Vector3.new(0, Config.CoinOffset, 0)
+    local distAtTouch = dist
     fireTouch(target, charParts())
     FarmState.targetAttempts = FarmState.targetAttempts + 1
     if not target.Parent or not isCoinLive(target) then
-        -- я подобрал (fireTouch в 10 студах = я рядом)
+        -- sync: мы в fireTouch-радиусе (< 10) и монета исчезла — почти
+        -- всегда наш подбор. Ставим lastCollectAt сразу, без async.
+        if distAtTouch < 10 then
+            FarmState.lastCollectAt = now
+            FarmState.lastCoinAt = now
+            FarmState.lastRealFarmAt = now
+        end
         FarmState.lastCoinPos = nil
         FarmState.pendingCoinPos = nil
         FarmState.lastCoinDist = nil
         FarmState.currentCoin = nil
         FarmState.targetAttempts = 0
         FarmState.targetSince = 0
-        FarmState.lastCollectAt = now
-        FarmState.lastCoinAt = now
-        FarmState.lastRealFarmAt = now
-        if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
+        -- НЕ обнуляем bv.Velocity здесь — если монету взял чужой, летим
+        -- дальше сразу. Если монет больше нет — следующий кадр masterStep
+        -- сам увидит target == nil и корректно переключит фазу.
     end
 end
         return
