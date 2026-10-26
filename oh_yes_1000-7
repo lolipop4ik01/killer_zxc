@@ -14,6 +14,10 @@ local LP = Players.LocalPlayer
 local WS = workspace
 local DEBUG_VERBOSE = false  -- true = все диагностические warn, false = только критические
 local function dbg(...) if DEBUG_VERBOSE then warn(...) end end
+
+-- уникальный токен текущего запуска. Старые loop'ы видят чужой токен и выходят.
+local MY_TOKEN = tostring(tick()) .. "_" .. tostring(math.random(100000, 999999))
+getgenv().MM2FarmActiveToken = MY_TOKEN
 pcall(function() WS.FallenPartsDestroyHeight = -5000 end)
 
 warn(string.format("[ENV] writefile=%s readfile=%s isfile=%s makefolder=%s isfolder=%s",
@@ -66,6 +70,13 @@ local function saveConfig()
         warn("[SAVE] writefile unavailable in this executor")
         return false 
     end
+    -- старый экземпляр не должен писать
+    local activeToken = getgenv().MM2FarmActiveToken
+    if activeToken and activeToken ~= MY_TOKEN then
+        warn(string.format("[SAVE-BLOCK] old instance tried to save TotalCoins=%d (token=%s, active=%s)",
+            Config.TotalCoins or -1, MY_TOKEN, activeToken))
+        return false
+    end
     local ok, j = pcall(HttpService.JSONEncode, HttpService, Config)
     if not ok then 
         warn("[SAVE] JSONEncode failed: " .. tostring(j))
@@ -107,6 +118,11 @@ if (Config.IdleFarmTimeout or 0) < 240 then
     Config.IdleFarmTimeout = 240
     warn("[CFG] IdleFarmTimeout forced to 240 (was less)")
 end
+-- BehindOffset минимум 8: дуло = handle + 2.5 forward, иначе дуло внутри мардера
+if (Config.BehindOffset or 0) < 8 then
+    Config.BehindOffset = 8
+    warn("[CFG] BehindOffset forced to 8 (was less than 8)")
+end
 
 local FarmState = {
     running = false, conn = nil,
@@ -145,6 +161,10 @@ local FarmState = {
     postSavedPos = nil,
     lastRealFarmAt = tick(),
     lastIdleWarnAt = 0,
+    gunGrabInProgress = false,
+    _lastGunLog = 0,
+    shotInProgress = false,
+    gunRetryAt = 0,
 }
 _G.FarmState = FarmState
 _G.Config = Config
@@ -587,27 +607,88 @@ local function charParts()
     return out
 end
 
+-- проверяет, находится ли объект внутри чьего-то Character (шериф/игрок держит)
+local function isInsideCharacter(inst)
+    local p = inst
+    while p and p ~= WS do
+        if p:IsA("Model") and p:FindFirstChildOfClass("Humanoid") then
+            return true
+        end
+        local plr = Players:GetPlayerFromCharacter(p)
+        if plr then return true end
+        p = p.Parent
+    end
+    return false
+end
+
+local function findGunDropParts()
+    -- 1) прямой потомок workspace с именем GunDrop, лежащий на земле
+    -- 2) рекурсивно (Mansion2.GunDrop), но НЕ в character и НЕ в Backpack
+    local obj = nil
+
+    -- ищем всех кандидатов с именем "GunDrop"
+    local function isDroppedGun(candidate)
+        if not candidate then return false end
+        if isInsideCharacter(candidate) then return false end
+        -- если это Tool в Backpack игрока — не дроп
+        local par = candidate.Parent
+        if par and par.Name == "Backpack" then return false end
+        return true
+    end
+
+    -- сначала прямые дети
+    for _, c in ipairs(WS:GetChildren()) do
+        if c.Name == "GunDrop" and isDroppedGun(c) then
+            obj = c
+            break
+        end
+    end
+
+    -- потом рекурсивно
+    if not obj then
+        for _, c in ipairs(WS:GetDescendants()) do
+            if c.Name == "GunDrop" and isDroppedGun(c) then
+                obj = c
+                break
+            end
+        end
+    end
+
+    -- последний вариант: Tool с "gun" в имени, но точно не в character / не в Backpack
+    if not obj then
+        for _, c in ipairs(WS:GetDescendants()) do
+            if c:IsA("Tool") and c.Name:lower():find("gun") and isDroppedGun(c) then
+                obj = c
+                break
+            end
+        end
+    end
+
+    if not obj then return nil, nil end
+
+    local parts = {}
+    if obj:IsA("BasePart") then
+        parts[#parts+1] = obj
+    elseif obj:IsA("Model") or obj:IsA("Tool") then
+        for _, p in ipairs(obj:GetDescendants()) do
+            if p:IsA("BasePart") and p.CanTouch then
+                parts[#parts+1] = p
+            end
+        end
+        if #parts == 0 then
+            for _, p in ipairs(obj:GetDescendants()) do
+                if p:IsA("BasePart") then parts[#parts+1] = p end
+            end
+        end
+    end
+
+    return parts, obj
+end
+
+-- обёртка для совместимости с masterStep/postFarmStep
 local function findGunDrop()
-    local gd = WS:FindFirstChild("GunDrop")
-    if gd then
-        if gd:IsA("BasePart") then return gd end
-        if gd:IsA("Model") and gd.PrimaryPart then return gd.PrimaryPart end
-        if gd:IsA("Model") then
-            local handle = gd:FindFirstChild("Handle", true)
-            if handle and handle:IsA("BasePart") then return handle end
-        end
-        if gd:IsA("Tool") then
-            local handle = gd:FindFirstChild("Handle")
-            if handle and handle:IsA("BasePart") then return handle end
-        end
-    end
-    for _, obj in ipairs(WS:GetChildren()) do
-        if obj:IsA("Tool") and obj.Name == "Gun" then
-            local handle = obj:FindFirstChild("Handle")
-            if handle and handle:IsA("BasePart") then return handle end
-        end
-    end
-    return nil
+    local parts = findGunDropParts()
+    return parts and parts[1] or nil
 end
 
 local function canSafelyGrab(gunPos)
@@ -621,9 +702,13 @@ end
 
 local function postFarmStep(hrp)
     local now = tick()
-    ensureMovers(hrp)
 
-    -- ФАЗА ОЖИДАНИЯ: сидим в сейв-зоне после промаха
+    -- SHOT IN PROGRESS: spawn делает всё, родитель не трогает персонажа
+    if FarmState.shotInProgress then
+        return
+    end
+
+    -- ФАЗА ОЖИДАНИЯ после промаха
     if FarmState.postWaitUntil > 0 and now < FarmState.postWaitUntil then
         if FarmState.postSavedPos then
             hrp.CFrame = CFrame.new(FarmState.postSavedPos)
@@ -635,42 +720,122 @@ local function postFarmStep(hrp)
     if hasGun() then
         local m = getMurd()
         if m and m.Character then
-            local mHRP = m.Character:FindFirstChild("HumanoidRootPart")
             local mHum = m.Character:FindFirstChildOfClass("Humanoid")
-            if mHRP and mHum and mHum.Health > 0 then
-                equipGun()
-
-                -- выстрел только если не в кулдауне проверки результата
+            if mHum and mHum.Health > 0 then
                 if now - FarmState.lastShot > Config.ShotInterval then
                     FarmState.lastShot = now
                     FarmState.postSavedPos = hrp.Position
-                    FarmState.postWaitUntil = now + 0.6
+                    FarmState.shotInProgress = true
 
-                    local behind = mHRP.Position - mHRP.CFrame.LookVector * Config.BehindOffset
-                    local shooterChar = m.Character
-
-                    -- телепорт к мардеру + выстрел (в spawn чтобы не блокировать Heartbeat)
                     task.spawn(function()
                         local h = getHRP()
-                        if not h then return end
-                        h.CFrame = CFrame.lookAt(behind, mHRP.Position)
+                        if not h then FarmState.shotInProgress = false; return end
+
+                        local m2 = getMurd()
+                        if not m2 or not m2.Character then FarmState.shotInProgress = false; return end
+                        local mHRP2 = m2.Character:FindFirstChild("HumanoidRootPart")
+                        local mHum2 = m2.Character:FindFirstChildOfClass("Humanoid")
+                        if not mHRP2 or not mHum2 or mHum2.Health <= 0 then FarmState.shotInProgress = false; return end
+                        local targetChar = m2.Character
+
+                        -- equip
+                        local g = getGunTool()
+                        if not g then warn("[POST] no gun"); FarmState.shotInProgress = false; return end
+                        if g.Parent ~= LP.Character then
+                            local hum = getHum()
+                            if hum then
+                                pcall(hum.EquipTool, hum, g)
+                                for i = 1, 8 do
+                                    task.wait(0.03)
+                                    if g.Parent == LP.Character then break end
+                                end
+                            end
+                        end
+                        if g.Parent ~= LP.Character then
+                            warn("[POST] gun not equipped")
+                            FarmState.shotInProgress = false
+                            return
+                        end
+
+                        -- capture current murderer position
+                        local targetPos = mHRP2.Position
+                        local lookDir = mHRP2.CFrame.LookVector
+
+                        -- teleport BEHIND murderer (BehindOffset >= 8)
+                        local behind = targetPos - lookDir * Config.BehindOffset
+                        h.CFrame = CFrame.lookAt(behind, targetPos)
                         h.AssemblyLinearVelocity = Vector3.zero
                         h.AssemblyAngularVelocity = Vector3.zero
-                        shootMurd()
-                    end)
 
-                    -- проверка результата через 0.6с
-                    task.spawn(function()
-                        task.wait(0.6)
-                        local mHum2 = shooterChar and shooterChar.Parent and shooterChar:FindFirstChildOfClass("Humanoid")
-                        if mHum2 and mHum2.Health > 0 then
-                            -- промах: ждём 6 секунд в сейв-зоне
+                        task.wait()
+                        task.wait()
+
+                        -- RE-READ muzzle from gun handle AFTER teleport
+                        local muzzlePos = nil
+                        local handle = g:FindFirstChild("Handle")
+                        if handle and handle:IsA("BasePart") then
+                            muzzlePos = handle.Position + handle.CFrame.LookVector * 2.5 + Vector3.new(0, 0.5, 0)
+                        end
+                        if not muzzlePos then
+                            for _, obj in ipairs(g:GetDescendants()) do
+                                if obj:IsA("Attachment") and obj.Name:lower():find("raycast") then
+                                    muzzlePos = obj.WorldPosition
+                                    break
+                                end
+                            end
+                        end
+                        if not muzzlePos then
+                            muzzlePos = h.Position + h.CFrame.LookVector * 2.5 + Vector3.new(0, 1, 0)
+                        end
+
+                        -- RE-READ target (murderer could move slightly)
+                        local freshMHRP = targetChar:FindFirstChild("HumanoidRootPart")
+                        local freshPos = freshMHRP and freshMHRP.Position or targetPos
+                        -- velocity prediction
+                        if freshMHRP then
+                            local vel = freshMHRP.AssemblyLinearVelocity
+                            freshPos = freshPos + vel * 0.05
+                        end
+
+                        -- find remote
+                        local shootEv = g:FindFirstChild("Shoot")
+                        if not shootEv or not shootEv:IsA("RemoteEvent") then
+                            for _, v in ipairs(g:GetDescendants()) do
+                                if v:IsA("RemoteEvent") then shootEv = v; break end
+                            end
+                        end
+                        if not shootEv then
+                            warn("[POST] no shoot remote")
+                            FarmState.shotInProgress = false
+                            return
+                        end
+
+                        -- FIRE
+                        local A_1 = CFrame.lookAt(muzzlePos, freshPos)
+                        local A_2 = CFrame.new(freshPos)
+                        pcall(function() shootEv:FireServer(A_1, A_2) end)
+                        warn(string.format("[POST] shot: muzzle=(%.1f,%.1f,%.1f) target=(%.1f,%.1f,%.1f) dist=%.1f",
+                            muzzlePos.X, muzzlePos.Y, muzzlePos.Z,
+                            freshPos.X, freshPos.Y, freshPos.Z,
+                            (muzzlePos - freshPos).Magnitude))
+
+                        -- check result
+                        task.wait(0.5)
+                        local checkHum = targetChar.Parent and targetChar:FindFirstChildOfClass("Humanoid")
+                        if checkHum and checkHum.Health > 0 then
+                            warn(string.format("[POST] MISS (hp=%.0f)", checkHum.Health))
                             FarmState.postWaitUntil = tick() + 6
-                            warn(string.format("[POST] miss → back to safe, wait 6s (hp=%.0f)", mHum2.Health))
                         else
-                            -- попал: murderer мёртв
+                            warn("[POST] HIT")
                             FarmState.postWaitUntil = 0
                         end
+
+                        -- return to saved position
+                        h.CFrame = CFrame.new(FarmState.postSavedPos or h.Position)
+                        h.AssemblyLinearVelocity = Vector3.zero
+                        h.AssemblyAngularVelocity = Vector3.zero
+
+                        FarmState.shotInProgress = false
                     end)
                 end
                 return
@@ -679,7 +844,7 @@ local function postFarmStep(hrp)
         return
     end
 
-    -- нет пушки — пробуем подобрать
+    -- нет пушки — подбираем
     if Config.AutoGrabGun then
         local gd = findGunDrop()
         if gd then
@@ -687,15 +852,17 @@ local function postFarmStep(hrp)
             if safe then
                 local delta = gd.Position - hrp.Position
                 if delta.Magnitude > 3 then
+                    ensureMovers(hrp)
                     FarmState.bv.Velocity = delta.Unit * Config.FlightSpeed
                     if FarmState.bg then FarmState.bg.CFrame = CFrame.new(hrp.Position) * CFrame.Angles(math.rad(90), 0, 0) end
                 else
+                    ensureMovers(hrp)
                     FarmState.bv.Velocity = Vector3.zero
                     fireTouch(gd, charParts())
                 end
                 return
             else
-                FarmState.bv.Velocity = Vector3.zero
+                if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
                 return
             end
         end
@@ -717,6 +884,7 @@ local function masterStep()
     local hrp = getHRP()
     local hum = getHum()
     if not hrp or not hum or hum.Health <= 0 then return end
+    if FarmState.gunGrabInProgress then return end
 
     local pos = hrp.Position
 
@@ -842,25 +1010,100 @@ local function masterStep()
             return
         end
 
-if Config.AutoGrabGun and not hasGun() then
-    local gd = findGunDrop()
-            if gd then
-                local distToGun = (gd.Position - pos).Magnitude
-                local safe, distToMurd = canSafelyGrab(gd.Position)
-                if safe and distToGun <= Config.MaxGunDistance and now - FarmState.lastGrabAttempt > 2 then
-                    FarmState.lastGrabAttempt = now
-                    local savedCFrame = hrp.CFrame
-                    hrp.CFrame = gd.CFrame
-                    task.wait(0.1)
-                    fireTouch(gd, charParts())
-                    task.wait(0.1)
-                    hrp.CFrame = savedCFrame
-                    task.wait(0.1)
-                    if hasGun() then equipGun() end
-                    return
-                end
-            end
+if Config.AutoGrabGun and not hasGun() and not FarmState.gunGrabInProgress then
+    local allParts, gunObj = findGunDropParts()
+    if allParts and #allParts > 0 then
+        local gd = allParts[1]
+        local distToGun = (gd.Position - pos).Magnitude
+        local safe, distToMurd = canSafelyGrab(gd.Position)
+
+        if not FarmState._lastGunLog or now - FarmState._lastGunLog > 2 then
+            FarmState._lastGunLog = now
+            warn(string.format("[GUN] parts=%d dist=%.0f safe=%s distMurd=%.0f retryIn=%.1fs",
+                #allParts, distToGun, tostring(safe), distToMurd,
+                math.max(0, (FarmState.gunRetryAt or 0) - now)))
         end
+
+        -- условия: safe (мардер >= GunSafeDist) + в радиусе + прошло 3с с прошлой попытки
+        if safe and distToGun <= Config.MaxGunDistance 
+           and (not FarmState.gunRetryAt or now >= FarmState.gunRetryAt) then
+            
+            FarmState.gunRetryAt = now + 3
+            FarmState.gunGrabInProgress = true
+
+            task.spawn(function()
+                local h = getHRP()
+                if not h then FarmState.gunGrabInProgress = false; return end
+
+                local freshParts, freshObj = findGunDropParts()
+                if not freshParts or #freshParts == 0 then 
+                    FarmState.gunGrabInProgress = false
+                    return 
+                end
+
+                local c = LP.Character
+                local hum = getHum()
+                local savedCF = h.CFrame
+
+                if freshObj and freshObj:IsA("Tool") and hum then
+                    pcall(hum.EquipTool, hum, freshObj)
+                    task.wait(0.03)
+                    if hasGun() then
+                        warn("[GUN] got via EquipTool")
+                        FarmState.gunGrabInProgress = false
+                        return
+                    end
+                end
+
+                detachMovers()
+                if hum then hum.PlatformStand = false end
+
+                local savedCC = {}
+                if c then
+                    for _, p in ipairs(c:GetDescendants()) do
+                        if p:IsA("BasePart") then
+                            savedCC[p] = p.CanCollide
+                            p.CanCollide = true
+                        end
+                    end
+                end
+
+                local charPartsList = {}
+                if c then
+                    for _, p in ipairs(c:GetDescendants()) do
+                        if p:IsA("BasePart") then charPartsList[#charPartsList+1] = p end
+                    end
+                end
+
+                -- TP → fireTouch → TP back в 1 кадр
+                local basePos = freshParts[1].Position
+                h.CFrame = CFrame.new(basePos)
+                h.AssemblyLinearVelocity = Vector3.zero
+                h.AssemblyAngularVelocity = Vector3.zero
+
+                for _, gp in ipairs(freshParts) do
+                    fireTouch(gp, charPartsList)
+                end
+
+                task.wait()
+
+                h.CFrame = savedCF
+                h.AssemblyLinearVelocity = Vector3.zero
+                h.AssemblyAngularVelocity = Vector3.zero
+
+                if hum then hum.PlatformStand = true end
+                for part, cc in pairs(savedCC) do
+                    if part and part.Parent then part.CanCollide = cc end
+                end
+
+                warn(string.format("[GUN] tp done (retry in 3s if not got): got=%s", tostring(hasGun())))
+                FarmState.gunGrabInProgress = false
+            end)
+
+            return
+        end
+    end
+end
 
         ensureMovers(hrp)
 
@@ -1104,14 +1347,18 @@ local function monitorServers()
     end
 end
 
+local MY_TOKEN = tostring(tick()) .. "_" .. tostring(math.random(100000, 999999))
+getgenv().MM2FarmActiveToken = MY_TOKEN
+
 task.spawn(function()
-    warn("[MON] loop started")
-    while getgenv().MM2FarmLoaded ~= false do
-        task.wait(2)
+    warn("[MON] loop started (token=" .. MY_TOKEN .. ")")
+    task.wait(2)
+    while getgenv().MM2FarmActiveToken == MY_TOKEN do
         local ok, err = pcall(monitorServers)
         if not ok then warn("[MON] error: " .. tostring(err)) end
+        task.wait(2)
     end
-    warn("[MON] loop ended")
+    warn("[MON] loop ended (token=" .. MY_TOKEN .. ")")
 end)
 
 task.spawn(function()
@@ -1176,6 +1423,7 @@ task.spawn(function()
     local roundEnd = gp:FindFirstChild("RoundEndFade")
     if roundEnd then
         roundEnd.OnClientEvent:Connect(function()
+            saveConfig()  -- сохраняем счётчики в конце раунда
             FarmState.roundActiveRemote = false
             FarmState.coinCount = 0
             FarmState.coinLimit = 50
@@ -1580,6 +1828,7 @@ local function buildGUI()
         if noRenderGui then pcall(function() noRenderGui:Destroy() end) end
         pcall(function() gui:Destroy() end); pcall(function() notifGui:Destroy() end)
         pcall(function() hudGui:Destroy() end)
+        getgenv().MM2FarmActiveToken = nil
         getgenv().MM2FarmLoaded = false
     end)
 
