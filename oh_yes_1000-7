@@ -868,9 +868,13 @@ local function postFarmStep(hrp)
                             local uL = murdLook.Magnitude > 0.1 and murdLook.Unit or Vector3.new(0, 0, -1)
                             local uR = uL:Cross(Vector3.new(0, 1, 0))
                             if uR.Magnitude < 0.01 then uR = Vector3.new(1, 0, 0) else uR = uR.Unit end
-                            -- ниже их HRP на VERT, ближе к спине. дуло смотрит вверх-вперёд в их HRP
+                            -- HRP сзади-слева от мардера в ЕГО системе координат. Смотрим
+                            -- НЕ на него, а ПАРАЛЛЕЛЬНО ему — LookVector = его LookVector.
+                            -- Тогда правый бок (RightVector, правая рука с пушкой) упирается
+                            -- ровно в его спину (в HumanoidRootPart), а мы смотрим вперёд,
+                            -- как будто стоим прямо у него за спиной.
                             local hrpPos = murdPos - uL * BACK_TOTAL - uR * ARM_SIDE - Vector3.new(0, VERT, 0)
-                            return CFrame.lookAt(hrpPos, murdPos)
+                            return CFrame.lookAt(hrpPos, hrpPos + uL)
                         end
 
                         -- мгновенный первый снап
@@ -896,8 +900,13 @@ local function postFarmStep(hrp)
                         local freshMHRP = targetChar:FindFirstChild("HumanoidRootPart")
                         local freshPos  = freshMHRP and freshMHRP.Position or targetPos
                         local freshLook = freshMHRP and freshMHRP.CFrame.LookVector or lookDir
-                        -- дуло = 0.5 студа сзади центра мардера, направлено в его центр
-                        local muzzlePos = freshPos - freshLook.Unit * 0.5
+                        -- Дуло нашей пушки = наш HRP + правый бок (RightVector) + вынос вперёд
+                        -- (LookVector). Так как HRP сзади-слева и смотрит параллельно
+                        -- мардеру, эта точка физически сидит в его спине.
+                        local muzzlePos = h.Position
+                            + h.CFrame.RightVector * ARM_SIDE
+                            + h.CFrame.LookVector * math.max(0.4, GUN_FWD - 1.0)
+                            - Vector3.new(0, VERT * 0.5, 0)
 
                         -- find remote
                         local shootEv = g:FindFirstChild("Shoot")
@@ -931,8 +940,10 @@ local function postFarmStep(hrp)
                             local rHRP = targetChar:FindFirstChild("HumanoidRootPart")
                             if rHRP then
                                 local rp  = rHRP.Position
-                                local rl  = rHRP.CFrame.LookVector.Unit
-                                local rmz = rp - rl * 0.5
+                                local rmz = h.Position
+                                    + h.CFrame.RightVector * ARM_SIDE
+                                    + h.CFrame.LookVector * math.max(0.4, GUN_FWD - 1.0)
+                                    - Vector3.new(0, VERT * 0.5, 0)
                                 pcall(function() shootEv:FireServer(CFrame.lookAt(rmz, rp), CFrame.new(rp)) end)
                                 warn("[POST] retry shot fired")
                             end
