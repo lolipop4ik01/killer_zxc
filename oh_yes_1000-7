@@ -18,6 +18,12 @@ local function dbg(...) if DEBUG_VERBOSE then warn(...) end end
 -- уникальный токен текущего запуска. Старые loop'ы видят чужой токен и выходят.
 local MY_TOKEN = tostring(tick()) .. "_" .. tostring(math.random(100000, 999999))
 getgenv().MM2FarmActiveToken = MY_TOKEN
+-- Уникальный токен экземпляра для MM2FarmLoaded. Старые циклы проверяют
+-- MM2FarmLoaded == ИХ токен, поэтому при перезапуске гарантированно выходят.
+-- Раньше был boolean true/false: unload ставил false, но верхняя строка
+-- сразу возвращала true, старые циклы (время, БП) этого не замечали и
+-- продолжали работать параллельно — дубли времени/БП сканера = "лаги".
+local MY_LOADED = MY_TOKEN .. "_loaded"
 
 -- Убиваем старый экземпляр СРАЗУ, до создания нового Config/GUI.
 -- Иначе старый HUD живёт 1-2 сек пока идёт загрузка, и клик на его reset
@@ -27,6 +33,11 @@ if getgenv().MM2FarmLoaded then
         pcall(getgenv().MM2FarmUnload) 
     end 
 end
+-- КРИТИЧНО: ставим флаг ДО task.spawn ниже. Иначе циклы, которые начинаются
+-- с `while getgenv().MM2FarmLoaded do` без первого yield, могут завершиться
+-- мгновенно (executor выполняет task.spawn синхронно до первого yield,
+-- а yield у нас внутри тела цикла). Именно из-за этого не шло время и БП.
+getgenv().MM2FarmLoaded = MY_LOADED
 
 pcall(function() WS.FallenPartsDestroyHeight = -5000 end)
 
@@ -54,6 +65,8 @@ local Config = {
     MaxGunDistance = 900,
     ArmSideOffset = 1.3,
     GunFwdOffset = 2.5,
+    BackExtraOffset = 0.5,
+    MagnetHoldTime = 0.9,
     
     HopOnError = true,
     ReconnectDelay = 5,
@@ -378,7 +391,8 @@ local function startOptimize()
     if not optConn then optConn = WS.DescendantAdded:Connect(function(d) if Config.TextureStrip then task.defer(stripOne, d) end end) end
     if not optThread then
         optThread = task.spawn(function()
-            while getgenv().MM2FarmLoaded do
+            task.wait(0.5)
+            while getgenv().MM2FarmLoaded == MY_LOADED do
                 task.wait(5)
                 -- aggressiveStrip убран: WS.DescendantAdded уже ловит новые объекты
                 if Config.LightingOpt then applyLighting() end
@@ -839,42 +853,48 @@ local function postFarmStep(hrp)
                             end
                         end
 
-                        local ARM_SIDE = Config.ArmSideOffset or 1.3
-                        local GUN_FWD  = Config.GunFwdOffset  or 2.5
+                        local ARM_SIDE   = Config.ArmSideOffset   or 1.3
+                        local GUN_FWD    = Config.GunFwdOffset    or 2.5
+                        local BACK_EXTRA = Config.BackExtraOffset or 0.5
+                        local BACK_TOTAL = GUN_FWD + BACK_EXTRA
 
-                        -- HRP ставим так, чтобы правая рука (RightVector*ARM_SIDE) + дуло (LookVector*GUN_FWD) легли в мардера
-                        local function calcMagnetPos(murdPos, fromPos)
-                            local toM = murdPos - fromPos
-                            local uL = toM.Magnitude > 0.1 and toM.Unit or Vector3.new(0, 0, -1)
+                        -- HRP всегда сзади мардера В ЕГО СОБСТВЕННОЙ ОСИ:
+                        --   смещение по его LookVector*BACK_TOTAL (назад)
+                        --   смещение по его RightVector*ARM_SIDE (в его левую сторону → наша правая рука на его позвоночнике)
+                        -- смотрим мардеру в спину. мардер.LookVector ≈ наш.LookVector.
+                        local function calcMagnet(murdPos, murdLook)
+                            local uL = murdLook.Magnitude > 0.1 and murdLook.Unit or Vector3.new(0, 0, -1)
                             local uR = uL:Cross(Vector3.new(0, 1, 0))
                             if uR.Magnitude < 0.01 then uR = Vector3.new(1, 0, 0) else uR = uR.Unit end
-                            return murdPos - uR * ARM_SIDE - uL * GUN_FWD
+                            local hrpPos = murdPos - uL * BACK_TOTAL - uR * ARM_SIDE
+                            return CFrame.lookAt(hrpPos, murdPos)
                         end
 
                         -- мгновенный первый снап
-                        local firstPos = calcMagnetPos(targetPos, h.Position)
-                        h.CFrame = CFrame.lookAt(firstPos, targetPos)
+                        h.CFrame = calcMagnet(targetPos, lookDir)
                         h.AssemblyLinearVelocity = Vector3.zero
                         h.AssemblyAngularVelocity = Vector3.zero
 
-                        -- MAGNET: каждый кадр держим HRP в позиции + ориентацию на мардера
+                        -- MAGNET: каждый Heartbeat ЖЕСТКО ставим CFrame (сильнее BodyPosition — коллизии не оттолкнут)
                         local magnetConn = RunService.Heartbeat:Connect(function()
                             local curr = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
-                            if not curr then return end
-                            local desired = calcMagnetPos(curr.Position, h.Position)
-                            h.CFrame = CFrame.lookAt(desired, curr.Position)
+                            if not curr or not curr.Parent then return end
+                            h.CFrame = calcMagnet(curr.Position, curr.CFrame.LookVector)
                             h.AssemblyLinearVelocity = Vector3.zero
                             h.AssemblyAngularVelocity = Vector3.zero
                         end)
 
-                        -- сервер успевает увидеть новую позицию
-                        task.wait(0.1)
+                        local magnetStart = tick()
 
-                        -- свежая позиция мардера (магнит уже подтянул нас вплотную)
+                        -- сервер видит позицию
+                        task.wait(0.15)
+
+                        -- свежие данные (магнит уже вплотную)
                         local freshMHRP = targetChar:FindFirstChild("HumanoidRootPart")
-                        local freshPos = freshMHRP and freshMHRP.Position or targetPos
-                        -- дуло: правая рука в мардере + короткий форвард, чтобы не совпало с таргетом 1:1
-                        local muzzlePos = h.Position + h.CFrame.RightVector * ARM_SIDE + h.CFrame.LookVector * math.max(0.4, GUN_FWD - 1.5)
+                        local freshPos  = freshMHRP and freshMHRP.Position or targetPos
+                        local freshLook = freshMHRP and freshMHRP.CFrame.LookVector or lookDir
+                        -- дуло = 1 студ сзади центра мардера, направлено в его центр
+                        local muzzlePos = freshPos - freshLook.Unit * 1.0
 
                         -- find remote
                         local shootEv = g:FindFirstChild("Shoot")
@@ -899,21 +919,41 @@ local function postFarmStep(hrp)
                             freshPos.X, freshPos.Y, freshPos.Z,
                             (muzzlePos - freshPos).Magnitude))
 
-                        -- check result
+                        -- проверка через 0.5с (магнит всё ещё держит)
                         task.wait(0.5)
                         local checkHum = targetChar.Parent and targetChar:FindFirstChildOfClass("Humanoid")
                         if checkHum and checkHum.Health > 0 then
-                            warn(string.format("[POST] MISS (hp=%.0f)", checkHum.Health))
+                            warn(string.format("[POST] MISS (hp=%.0f) — повтор в окне магнита", checkHum.Health))
+                            -- повторный выстрел пока магнит ещё держит мардера вплотную
+                            local rHRP = targetChar:FindFirstChild("HumanoidRootPart")
+                            if rHRP then
+                                local rp  = rHRP.Position
+                                local rl  = rHRP.CFrame.LookVector.Unit
+                                local rmz = rp - rl * 1.0
+                                pcall(function() shootEv:FireServer(CFrame.lookAt(rmz, rp), CFrame.new(rp)) end)
+                                warn("[POST] retry shot fired")
+                            end
                             FarmState.postWaitUntil = tick() + (Config.MissCooldown or 2.0)
                         else
                             warn("[POST] HIT")
                             FarmState.postWaitUntil = 0
                         end
 
+                        -- держим магнит до MagnetHoldTime (0.9s) от старта
+                        local HOLD = Config.MagnetHoldTime or 0.9
+                        local elapsed = tick() - magnetStart
+                        if elapsed < HOLD then task.wait(HOLD - elapsed) end
+
                         -- снимаем магнит
                         if magnetConn then pcall(function() magnetConn:Disconnect() end) end
 
                         -- улетаем под землю от текущей позиции (глубина из SafeDepth)
+                        -- noclip уже включен — не всплывём сквозь пол
+                        if h.Parent then
+                            for _, p in ipairs(h.Parent:GetDescendants()) do
+                                if p:IsA("BasePart") then p.CanCollide = false end
+                            end
+                        end
                         local exitGroundY = findGroundY(h.Position) or h.Position.Y
                         local exitY = exitGroundY - Config.SafeDepth
                         local exitPos = Vector3.new(h.Position.X, exitY, h.Position.Z)
@@ -1300,7 +1340,7 @@ local function startFarm()
     if not hrp then
         task.spawn(function()
             local deadline = tick() + 60
-            while tick() < deadline and getgenv().MM2FarmLoaded do
+            while tick() < deadline and getgenv().MM2FarmLoaded == MY_LOADED do
                 task.wait(1)
                 if getHRP() and Config.AutoFarm then startFarm(); return end
             end
@@ -1463,12 +1503,11 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    while getgenv().MM2FarmLoaded do
+    task.wait(0.5)
+    while getgenv().MM2FarmLoaded == MY_LOADED do
         task.wait(1)
-        if FarmState.running then
-            Config.TotalTime = (Config.TotalTime or 0) + 1
-            if Config.TotalTime % 120 == 0 then saveConfig() end
-        end
+        Config.TotalTime = (Config.TotalTime or 0) + 1
+        if Config.TotalTime % 120 == 0 then saveConfig() end
     end
 end)
 
@@ -1541,14 +1580,97 @@ task.spawn(function()
     end
 end)
 
+local function parseNum(s)
+    if type(s) == "number" then return s end
+    if type(s) ~= "string" then return nil end
+    local digits = s:gsub("[^%d]", "")
+    if digits == "" then return nil end
+    return tonumber(digits)
+end
+
+local function findBpLabel()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+
+    -- известные точные пути
+    local paths = {
+        {"CrossPlatform", "Halloween2026", "MainEvent", "Main", "BattlePass", "Title", "Tokens", "Container", "TextLabel"},
+        {"CrossPlatform", "Halloween2025", "MainEvent", "Main", "BattlePass", "Title", "Tokens", "Container", "TextLabel"},
+        {"CrossPlatform", "Halloween2024", "MainEvent", "Main", "BattlePass", "Title", "Tokens", "Container", "TextLabel"},
+    }
+    for _, path in ipairs(paths) do
+        local node, ok = pg, true
+        for _, name in ipairs(path) do
+            node = node and node:FindFirstChild(name)
+            if not node then ok = false; break end
+        end
+        if ok and node and node:IsA("TextLabel") and parseNum(node.Text) then return node end
+    end
+
+    -- fallback: Tokens.Container.TextLabel где угодно в PlayerGui
+    for _, obj in ipairs(pg:GetDescendants()) do
+        if obj:IsA("TextLabel") and obj.Name == "TextLabel" then
+            local par = obj.Parent
+            if par and par.Name == "Container" then
+                local gp = par.Parent
+                if gp and gp.Name == "Tokens" and parseNum(obj.Text) then
+                    return obj
+                end
+            end
+        end
+    end
+
+    -- fallback 2: TextLabel, у которого в 6 уровнях предков есть "Tokens"/"BattlePass"
+    for _, obj in ipairs(pg:GetDescendants()) do
+        if obj:IsA("TextLabel") and parseNum(obj.Text) then
+            local p, hit = obj.Parent, false
+            for _ = 1, 6 do
+                if not p then break end
+                local ln = p.Name:lower()
+                if ln:find("tokens") or ln:find("battlepass") then hit = true; break end
+                p = p.Parent
+            end
+            if hit then return obj end
+        end
+    end
+
+    return nil
+end
+
 task.spawn(function()
-    while getgenv().MM2FarmLoaded do
-        task.wait(1)
-        local success, text = pcall(function()
-            return game:GetService("Players").LocalPlayer.PlayerGui.CrossPlatform.Halloween2026.MainEvent.Main.BattlePass.Title.Tokens.Container.TextLabel.Text
-        end)
-        if success and text then
-            FarmState.bpCoins = tonumber(text) or FarmState.bpCoins
+    task.wait(0.5)
+    local label = nil
+    local lastScan = 0
+    local scanEvery = 5
+    local emptyScans = 0
+    local MAX_EMPTY = 12  -- 12 * 5s = 60s, потом перестаём искать
+    while getgenv().MM2FarmLoaded == MY_LOADED do
+        task.wait(0.5)
+        local now = tick()
+
+        if label and label.Parent then
+            local n = parseNum(label.Text)
+            if n then FarmState.bpCoins = n end
+        else
+            label = nil
+            if now - lastScan > scanEvery and emptyScans < MAX_EMPTY then
+                lastScan = now
+                local pg = LP:FindFirstChild("PlayerGui")
+                -- дешёвый гейт: не сканируем всё дерево, если нет CrossPlatform
+                if pg and pg:FindFirstChild("CrossPlatform") then
+                    local found = findBpLabel()
+                    if found then
+                        label = found
+                        local n = parseNum(found.Text)
+                        if n then FarmState.bpCoins = n end
+                        emptyScans = 0
+                    else
+                        emptyScans = emptyScans + 1
+                    end
+                else
+                    emptyScans = emptyScans + 1
+                end
+            end
         end
     end
 end)
@@ -1689,7 +1811,8 @@ local function buildGUI()
             
             local hours = math.floor(totalTime / 3600)
             local mins = math.floor((totalTime % 3600) / 60)
-            local timeStr = string.format("%02d:%02d", hours, mins)
+            local secs = math.floor(totalTime % 60)
+            local timeStr = string.format("%02d:%02d:%02d", hours, mins, secs)
             
             local phaseMap = {
                 idle = "Ожидание", wait = "Спрятан", farm = "Фарм", post = "Пост-фарм"
@@ -1902,8 +2025,10 @@ local function buildGUI()
     section("После лимита (Пост-фарм)")
     toggle("Пост-фарм", "PostFarmAuto", "Включает действия после сбора лимита (стрельба или ресет)")
     toggle("За спиной", "StickyBehind", "Прилипать к мардеру со спины для выстрела (legacy)")
-    inputSlider("Смещение вправо", "ArmSideOffset", 0.5, 3, 2, "Насколько HRP смещать вбок от мардера, чтобы правая рука легла на таргет")
-    inputSlider("Вынос пушки", "GunFwdOffset", 1, 6, 2, "Дистанция от HRP вперед до таргета — дуло должно касаться мардера")
+    inputSlider("Смещение вбок", "ArmSideOffset", 0.5, 3, 2, "Насколько HRP смещать влево от мардера, чтобы правая рука с пушкой легла на его спину")
+    inputSlider("Дист. до мардера", "GunFwdOffset", 1, 6, 2, "Сколько студов от HRP до мардера (дуло касается его спины)")
+    inputSlider("Доп. назад", "BackExtraOffset", 0, 3, 2, "Ещё столько студов назад сверх GunFwdOffset")
+    inputSlider("Магнит держит (сек)", "MagnetHoldTime", 0.3, 2.0, 2, "Сколько секунд магнит не отпускает мардера после телепорта")
     inputSlider("Задержка выстрела", "ShotInterval", 0.1, 2, 2, "Интервал между выстрелами")
     inputSlider("Кулдаун после промаха", "MissCooldown", 0.5, 10, 1, "Секунд между попытками если промах. Меньше = быстрее, но сервер может флагать")
     toggle("Подбирать пушку", "AutoGrabGun", "Пытаться подобрать выпавший пистолет во время фарма")
@@ -1990,7 +2115,8 @@ local function buildGUI()
     getgenv().MM2Farm_notifGui = notifGui
     return gui
 end
-getgenv().MM2FarmLoaded = true
+-- флаг уже выставлен в самом верху (MY_LOADED). Здесь ставить `= true` нельзя:
+-- перезапишет токен, и все циклы выше начнут выходить.
 local mainGui = buildGUI()
 getgenv().MM2FarmUnload = function()
     saveConfig()
