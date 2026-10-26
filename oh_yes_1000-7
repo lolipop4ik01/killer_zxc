@@ -1297,6 +1297,35 @@ local function buildGUI()
     hudLbl.TextXAlignment = Enum.TextXAlignment.Center; hudLbl.TextYAlignment = Enum.TextYAlignment.Center
     hudLbl.Text = "Загрузка..."; hudLbl.Parent = hudFrame
 
+    -- кнопка сброса счётчика конфет
+    local hudResetBtn = Instance.new("TextButton")
+    hudResetBtn.Size = UDim2.fromOffset(20, 20)
+    hudResetBtn.Position = UDim2.new(1, -24, 0, 4)
+    hudResetBtn.BackgroundColor3 = C.bg3
+    hudResetBtn.BackgroundTransparency = 0.3
+    hudResetBtn.AutoButtonColor = false
+    hudResetBtn.Text = "⟲"
+    hudResetBtn.Font = FONT_B
+    hudResetBtn.TextSize = 13
+    hudResetBtn.TextColor3 = C.sub
+    hudResetBtn.BorderSizePixel = 0
+    hudResetBtn.Parent = hudFrame
+    corner(hudResetBtn, UDim.new(0, 4))
+    stroke(hudResetBtn)
+
+    hudResetBtn.MouseEnter:Connect(function()
+        hudResetBtn.TextColor3 = C.accent
+    end)
+    hudResetBtn.MouseLeave:Connect(function()
+        hudResetBtn.TextColor3 = C.sub
+    end)
+    hudResetBtn.MouseButton1Click:Connect(function()
+        Config.TotalCoins = 0
+        Config.TotalTime = 0
+        saveConfig()
+        if notifyGui then notifyGui("Счётчик сброшен", 1.5) end
+    end)
+
     task.spawn(function()
         while hudGui.Parent do
             task.wait(0.5)
