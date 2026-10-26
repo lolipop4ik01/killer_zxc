@@ -18,6 +18,16 @@ local function dbg(...) if DEBUG_VERBOSE then warn(...) end end
 -- уникальный токен текущего запуска. Старые loop'ы видят чужой токен и выходят.
 local MY_TOKEN = tostring(tick()) .. "_" .. tostring(math.random(100000, 999999))
 getgenv().MM2FarmActiveToken = MY_TOKEN
+
+-- Убиваем старый экземпляр СРАЗУ, до создания нового Config/GUI.
+-- Иначе старый HUD живёт 1-2 сек пока идёт загрузка, и клик на его reset
+-- блокируется guard'ом — файл остаётся со старым TotalCoins.
+if getgenv().MM2FarmLoaded then 
+    if getgenv().MM2FarmUnload then 
+        pcall(getgenv().MM2FarmUnload) 
+    end 
+end
+
 pcall(function() WS.FallenPartsDestroyHeight = -5000 end)
 
 warn(string.format("[ENV] writefile=%s readfile=%s isfile=%s makefolder=%s isfolder=%s",
@@ -32,15 +42,18 @@ local Config = {
     FlightSpeed = 45,
     CoinStayTime = 0.0,
     CoinOffset = 3,
-    SafeDepth = 50,
+    SafeDepth = 15,
     
     PostFarmAuto = true,
     StickyBehind = true,
     BehindOffset = 0.8,
     ShotInterval = 0.35,
+    MissCooldown = 2.0,
     AutoGrabGun = true,
     GunSafeDist = 5,
     MaxGunDistance = 900,
+    ArmSideOffset = 1.3,
+    GunFwdOffset = 2.5,
     
     HopOnError = true,
     ReconnectDelay = 5,
@@ -84,7 +97,9 @@ local function saveConfig()
     end
     local ok2, err = pcall(writefile, CONFIG_FILE, j)
     if not ok2 then
-        warn("[SAVE] writefile failed: " .. tostring(err) .. " path=" .. tostring(CONFIG_FILE))
+        warn("[SAVE] writefile FAILED: " .. tostring(err) .. " path=" .. tostring(CONFIG_FILE))
+    else
+        warn(string.format("[SAVE] ok TotalCoins=%d TotalTime=%d", Config.TotalCoins or 0, Config.TotalTime or 0))
     end
     return ok2
 end
@@ -165,6 +180,7 @@ local FarmState = {
     _lastGunLog = 0,
     shotInProgress = false,
     gunRetryAt = 0,
+    lastCoinDist = nil,
 }
 _G.FarmState = FarmState
 _G.Config = Config
@@ -517,7 +533,7 @@ local function findGroundY(fromPos)
     params.IgnoreWater = true
     params.RespectCanCollide = true
     local result = workspace:Raycast(
-        Vector3.new(fromPos.X, fromPos.Y + 50, fromPos.Z),
+        Vector3.new(fromPos.X, fromPos.Y, fromPos.Z),
         Vector3.new(0, -20000, 0),
         params
     )
@@ -813,32 +829,52 @@ local function postFarmStep(hrp)
                         local targetPos = mHRP2.Position
                         local lookDir = mHRP2.CFrame.LookVector
 
-                        -- teleport ВПЛОТНУЮ за мардера (BehindOffset = 2)
-                        local behind = targetPos - lookDir * Config.BehindOffset
-                        h.CFrame = CFrame.lookAt(behind, targetPos)
+                        -- снести прошлый safeBp от предыдущего выстрела
+                        if FarmState.safeBp then pcall(function() FarmState.safeBp:Destroy() end); FarmState.safeBp = nil end
+
+                        -- noclip на время магнита
+                        if h.Parent then
+                            for _, p in ipairs(h.Parent:GetDescendants()) do
+                                if p:IsA("BasePart") then p.CanCollide = false end
+                            end
+                        end
+
+                        local ARM_SIDE = Config.ArmSideOffset or 1.3
+                        local GUN_FWD  = Config.GunFwdOffset  or 2.5
+
+                        -- HRP ставим так, чтобы правая рука (RightVector*ARM_SIDE) + дуло (LookVector*GUN_FWD) легли в мардера
+                        local function calcMagnetPos(murdPos, fromPos)
+                            local toM = murdPos - fromPos
+                            local uL = toM.Magnitude > 0.1 and toM.Unit or Vector3.new(0, 0, -1)
+                            local uR = uL:Cross(Vector3.new(0, 1, 0))
+                            if uR.Magnitude < 0.01 then uR = Vector3.new(1, 0, 0) else uR = uR.Unit end
+                            return murdPos - uR * ARM_SIDE - uL * GUN_FWD
+                        end
+
+                        -- мгновенный первый снап
+                        local firstPos = calcMagnetPos(targetPos, h.Position)
+                        h.CFrame = CFrame.lookAt(firstPos, targetPos)
                         h.AssemblyLinearVelocity = Vector3.zero
                         h.AssemblyAngularVelocity = Vector3.zero
 
-                        -- 3 кадра чтобы сервер увидел позицию
-                        task.wait()
-                        task.wait()
-                        task.wait()
+                        -- MAGNET: каждый кадр держим HRP в позиции + ориентацию на мардера
+                        local magnetConn = RunService.Heartbeat:Connect(function()
+                            local curr = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+                            if not curr then return end
+                            local desired = calcMagnetPos(curr.Position, h.Position)
+                            h.CFrame = CFrame.lookAt(desired, curr.Position)
+                            h.AssemblyLinearVelocity = Vector3.zero
+                            h.AssemblyAngularVelocity = Vector3.zero
+                        end)
 
-                        -- RE-READ target (свежая позиция мардера)
+                        -- сервер успевает увидеть новую позицию
+                        task.wait(0.1)
+
+                        -- свежая позиция мардера (магнит уже подтянул нас вплотную)
                         local freshMHRP = targetChar:FindFirstChild("HumanoidRootPart")
                         local freshPos = freshMHRP and freshMHRP.Position or targetPos
-                        -- velocity prediction
-                        if freshMHRP then
-                            local vel = freshMHRP.AssemblyLinearVelocity
-                            freshPos = freshPos + vel * 0.03
-                        end
-
-                        -- muzzle = моя позиция + 1 студ в сторону мардера
-                        -- т.е. дуло физически в мардере, промах невозможен
-                        local myPos = h.Position
-                        local dirToMurd = (freshPos - myPos)
-                        local dirUnit = dirToMurd.Magnitude > 0.1 and dirToMurd.Unit or lookDir
-                        local muzzlePos = myPos + dirUnit * 1
+                        -- дуло: правая рука в мардере + короткий форвард, чтобы не совпало с таргетом 1:1
+                        local muzzlePos = h.Position + h.CFrame.RightVector * ARM_SIDE + h.CFrame.LookVector * math.max(0.4, GUN_FWD - 1.5)
 
                         -- find remote
                         local shootEv = g:FindFirstChild("Shoot")
@@ -849,6 +885,7 @@ local function postFarmStep(hrp)
                         end
                         if not shootEv then
                             warn("[POST] no shoot remote")
+                            if magnetConn then pcall(function() magnetConn:Disconnect() end) end
                             FarmState.shotInProgress = false
                             return
                         end
@@ -867,16 +904,30 @@ local function postFarmStep(hrp)
                         local checkHum = targetChar.Parent and targetChar:FindFirstChildOfClass("Humanoid")
                         if checkHum and checkHum.Health > 0 then
                             warn(string.format("[POST] MISS (hp=%.0f)", checkHum.Health))
-                            FarmState.postWaitUntil = tick() + 6
+                            FarmState.postWaitUntil = tick() + (Config.MissCooldown or 2.0)
                         else
                             warn("[POST] HIT")
                             FarmState.postWaitUntil = 0
                         end
 
-                        -- return to saved position
-                        h.CFrame = CFrame.new(FarmState.postSavedPos or h.Position)
+                        -- снимаем магнит
+                        if magnetConn then pcall(function() magnetConn:Disconnect() end) end
+
+                        -- улетаем под землю от текущей позиции (глубина из SafeDepth)
+                        local exitGroundY = findGroundY(h.Position) or h.Position.Y
+                        local exitY = exitGroundY - Config.SafeDepth
+                        local exitPos = Vector3.new(h.Position.X, exitY, h.Position.Z)
+                        h.CFrame = CFrame.new(exitPos)
                         h.AssemblyLinearVelocity = Vector3.zero
                         h.AssemblyAngularVelocity = Vector3.zero
+                        FarmState.postSavedPos = exitPos
+
+                        -- держим под землёй BodyPosition'ом, чтобы не всплывать и не падать
+                        FarmState.safeBp = Instance.new("BodyPosition")
+                        FarmState.safeBp.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                        FarmState.safeBp.P = 100000
+                        FarmState.safeBp.Position = exitPos
+                        FarmState.safeBp.Parent = h
 
                         FarmState.shotInProgress = false
                     end)
@@ -976,6 +1027,7 @@ local function masterStep()
         and math.abs(pos.Y - FarmState.lockedY) < 3000 then
         detachSafeMovers()
         FarmState.inSafeZone = false
+        setNoclip(false)
         setPhase("wait")
     end
     FarmState.lastHRPPos = pos
@@ -993,9 +1045,10 @@ local function masterStep()
                 and math.abs(pos.Y - groundY) < 50
                 and math.abs(hrp.AssemblyLinearVelocity.Y) < 20 then
                 FarmState.inSafeZone = true
+                setNoclip(true)
                 FarmState.lockedX = pos.X
                 FarmState.lockedZ = pos.Z
-                FarmState.lockedY = groundY - Config.SafeDepth
+                FarmState.lockedY = pos.Y - Config.SafeDepth
                 
                 hrp.CFrame = CFrame.new(FarmState.lockedX, FarmState.lockedY, FarmState.lockedZ)
                 
@@ -1034,21 +1087,10 @@ local function masterStep()
             return
         end
 
-        -- ЯВНЫЙ БЛОК ЗАДЕРЖКИ (через lastCollectAt, устойчив к спаму ремоутов)
+        -- ЯВНЫЙ БЛОК ЗАДЕРЖКИ: стоим на месте, никуда не летим
         if Config.CoinStayTime > 0 and FarmState.lastCollectAt > 0 
             and (now - FarmState.lastCollectAt) < Config.CoinStayTime then
-            local target = FarmState.lastCoinPos
-            if target then
-                local delta = target - pos
-                if delta.Magnitude > 1 then
-                    ensureMovers(hrp)
-                    FarmState.bv.Velocity = delta.Unit * Config.FlightSpeed
-                else
-                    if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
-                end
-            else
-                if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
-            end
+            if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
             if FarmState.bg then FarmState.bg.CFrame = CFrame.new(pos) * CFrame.Angles(math.rad(90), 0, 0) end
             return
         end
@@ -1157,12 +1199,21 @@ end
 if FarmState.currentCoin then
     if not FarmState.currentCoin.Parent or not isCoinLive(FarmState.currentCoin) then
         blacklistAdd(FarmState.currentCoin)
-        FarmState.lastCoinPos = FarmState.pendingCoinPos or (pos - Vector3.new(0, Config.CoinOffset, 0))
+        -- различаем: я подобрал (был близко) или чужой (был далеко)
+        local myDist = FarmState.lastCoinDist
+        if myDist and myDist < 15 then
+            -- я подобрал → задержка
+            FarmState.lastCollectAt = now
+            FarmState.lastCoinAt = now
+            FarmState.lastRealFarmAt = now
+        end
+        -- чужой подобрал → НЕ трогаем lastCollectAt, летим к следующей сразу
+        FarmState.lastCoinPos = nil
         FarmState.pendingCoinPos = nil
-        FarmState.stayUntil = now + Config.CoinStayTime
-        FarmState.currentCoin = nil; FarmState.targetAttempts = 0; FarmState.targetSince = 0
-        FarmState.lastCollectAt = now; FarmState.lastCoinAt = now
-        FarmState.lastRealFarmAt = now
+        FarmState.lastCoinDist = nil
+        FarmState.currentCoin = nil
+        FarmState.targetAttempts = 0
+        FarmState.targetSince = 0
     elseif now - FarmState.targetSince > 2.0 then
         blacklistAdd(FarmState.currentCoin)
                 blacklistAdd(FarmState.currentCoin)
@@ -1198,6 +1249,7 @@ if not FarmState.currentCoin or (now - FarmState.lastScan > 0.2) then
         local goal = target.Position - Vector3.new(0, Config.CoinOffset, 0)
         local delta = goal - pos
         local dist = delta.Magnitude
+        FarmState.lastCoinDist = (target.Position - pos).Magnitude
         
         -- ЛЕЖИМ НА ЖИВОТЕ (X=90)
         if FarmState.bg then FarmState.bg.CFrame = CFrame.new(pos) * CFrame.Angles(math.rad(90), 0, 0) end
@@ -1213,14 +1265,19 @@ if dist < 10 then
     fireTouch(target, charParts())
     FarmState.targetAttempts = FarmState.targetAttempts + 1
     if not target.Parent or not isCoinLive(target) then
-        FarmState.lastCoinPos = FarmState.pendingCoinPos
+        -- я подобрал (fireTouch в 10 студах = я рядом)
+        FarmState.lastCoinPos = nil
         FarmState.pendingCoinPos = nil
-        FarmState.stayUntil = now + Config.CoinStayTime
-                FarmState.currentCoin = nil; FarmState.targetAttempts = 0; FarmState.targetSince = 0
-                FarmState.lastCollectAt = now; FarmState.lastCoinAt = now
-                if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
-            end
-        end
+        FarmState.lastCoinDist = nil
+        FarmState.currentCoin = nil
+        FarmState.targetAttempts = 0
+        FarmState.targetSince = 0
+        FarmState.lastCollectAt = now
+        FarmState.lastCoinAt = now
+        FarmState.lastRealFarmAt = now
+        if FarmState.bv then FarmState.bv.Velocity = Vector3.zero end
+    end
+end
         return
     end
 
@@ -1614,8 +1671,14 @@ local function buildGUI()
     hudResetBtn.MouseButton1Click:Connect(function()
         Config.TotalCoins = 0
         Config.TotalTime = 0
-        saveConfig()
-        if notifyGui then notifyGui("Счётчик сброшен", 1.5) end
+        local saved = saveConfig()
+        if notifyGui then 
+            if saved then
+                notifyGui("Счётчик сброшен", 1.5)
+            else
+                notifyGui("ОШИБКА: файл не записан, смотри F9", 2.5)
+            end
+        end
     end)
 
     task.spawn(function()
@@ -1838,8 +1901,11 @@ local function buildGUI()
 
     section("После лимита (Пост-фарм)")
     toggle("Пост-фарм", "PostFarmAuto", "Включает действия после сбора лимита (стрельба или ресет)")
-    toggle("За спиной", "StickyBehind", "Прилипать к мардеру со спины для выстрела")
+    toggle("За спиной", "StickyBehind", "Прилипать к мардеру со спины для выстрела (legacy)")
+    inputSlider("Смещение вправо", "ArmSideOffset", 0.5, 3, 2, "Насколько HRP смещать вбок от мардера, чтобы правая рука легла на таргет")
+    inputSlider("Вынос пушки", "GunFwdOffset", 1, 6, 2, "Дистанция от HRP вперед до таргета — дуло должно касаться мардера")
     inputSlider("Задержка выстрела", "ShotInterval", 0.1, 2, 2, "Интервал между выстрелами")
+    inputSlider("Кулдаун после промаха", "MissCooldown", 0.5, 10, 1, "Секунд между попытками если промах. Меньше = быстрее, но сервер может флагать")
     toggle("Подбирать пушку", "AutoGrabGun", "Пытаться подобрать выпавший пистолет во время фарма")
     inputSlider("Дист. до мардера", "GunSafeDist", 1, 100, 0, "Безопасное расстояние до мардера (если ближе - скрипт не подберет пушку)")
     inputSlider("Макс. дист. до пушки", "MaxGunDistance", 50, 2000, 0, "На каком расстоянии скрипт увидит и полетит за пушкой")
@@ -1864,7 +1930,13 @@ local function buildGUI()
     section("Конфиг")
     btn("СОХРАНИТЬ", "Принудительно сохраняет текущие настройки в файл", function() if saveConfig() then notifyGui("Сохранено", 2) else notifyGui("Ошибка", 2) end end)
     btn("СБРОСИТЬ СТАТЫ", "Обнуляет общий счетчик монет и времени", function()
-        Config.TotalCoins = 0; Config.TotalTime = 0; saveConfig(); notifyGui("Статистика сброшена", 2)
+        Config.TotalCoins = 0
+        Config.TotalTime = 0
+        local saved = saveConfig()
+        if notifyGui then
+            if saved then notifyGui("Статистика сброшена", 2)
+            else notifyGui("ОШИБКА: файл не записан, смотри F9", 2.5) end
+        end
     end)
     btn("ВЫГРУЗИТЬ", "Полностью выключает скрипт и удаляет интерфейс", function()
         saveConfig()
@@ -1917,9 +1989,6 @@ local function buildGUI()
     getgenv().MM2Farm_hudGui = hudGui
     getgenv().MM2Farm_notifGui = notifGui
     return gui
-end
-if getgenv().MM2FarmLoaded then
-    if getgenv().MM2FarmUnload then pcall(getgenv().MM2FarmUnload) end
 end
 getgenv().MM2FarmLoaded = true
 local mainGui = buildGUI()
